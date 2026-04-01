@@ -120,6 +120,7 @@ venv.bak/
 # mkdocs documentation
 /site
 
+.claude
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -160,3 +161,6 @@ runs/
 third_party/
 
 adapter-tmp/
+
+data
+visualizations/
