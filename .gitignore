@@ -6,7 +6,7 @@ __pycache__/
 # C extensions
 *.so
 
-scripts/analyze_demo.py
+*analyze_demo*
 
 # Distribution / packaging
 .Python
