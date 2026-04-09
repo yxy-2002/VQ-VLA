@@ -1,0 +1,444 @@
+"""
+Train Behavior Cloning policy over a frozen Hand Action VAE.
+
+Predicts:
+  - arm_action  (dims 0-5): direct MLP head
+  - hand_action (dims 6-11): VAE.decode(reparam(prior + delta)) — VAE frozen
+
+Usage:
+    python imitation_learning/behavior_clone/scripts/train.py \
+        --train_dir data/20260327-11:10:43/demos/success/train \
+        --test_dir  data/20260327-11:10:43/demos/success/test \
+        --vae_ckpt  outputs/dim_2_best/checkpoint.pth \
+        --output_dir outputs/bc_simple_v1
+"""
+
+import argparse
+import importlib.util
+import os
+import sys
+import time
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_BC_ROOT = os.path.dirname(_SCRIPT_DIR)
+_PROJ_ROOT = os.path.abspath(os.path.join(_BC_ROOT, "..", ".."))
+_VAE_ROOT = os.path.join(_PROJ_ROOT, "vae")
+
+
+def _load(path: str, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_dataset_mod = _load(os.path.join(_BC_ROOT, "model/bc_dataset.py"), "bc_dataset")
+_policy_mod = _load(os.path.join(_BC_ROOT, "model/bc_policy.py"), "bc_policy")
+_utils_mod = _load(os.path.join(_VAE_ROOT, "model/utils.py"), "vae_utils")
+
+BCDataset = _dataset_mod.BCDataset
+compute_state_stats = _dataset_mod.compute_state_stats
+BCPolicy = _policy_mod.BCPolicy
+build_and_freeze_vae = _policy_mod.build_and_freeze_vae
+trainable_params = _policy_mod.trainable_params
+strip_vae_state_dict = _policy_mod.strip_vae_state_dict
+cosine_scheduler = _utils_mod.cosine_scheduler
+
+
+# ─── Args ──────────────────────────────────────────────────────────────────────
+
+
+def get_args():
+    p = argparse.ArgumentParser(description="Train BC policy with frozen VAE")
+    # Data
+    p.add_argument("--train_dir", type=str, required=True)
+    p.add_argument("--test_dir", type=str, required=True)
+    p.add_argument("--vae_ckpt", type=str,
+                   default="outputs/dim_2_best/checkpoint.pth")
+    p.add_argument("--output_dir", type=str, default="outputs/bc_simple_v1")
+    p.add_argument("--window_size", type=int, default=8,
+                   help="VAE prior window size — must match VAE training")
+    # Model
+    p.add_argument("--feat_dim", type=int, default=128,
+                   help="Per-branch feature width before fusion")
+    p.add_argument("--fusion_dim", type=int, default=256)
+    # Training
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=5e-4,
+                   help="Lower than VAE's 2e-3 — from-scratch CNN can spike at higher LR")
+    p.add_argument("--min_lr", type=float, default=1e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--total_steps", type=int, default=20000)
+    p.add_argument("--warmup_steps", type=int, default=500)
+    p.add_argument("--clip_grad", type=float, default=1.0)
+    p.add_argument("--num_workers", type=int, default=0,
+                   help="0 = single process. Default is 0 because all data is "
+                        "preloaded into RAM and forking workers can blow /dev/shm.")
+    p.add_argument("--seed", type=int, default=42)
+    # Logging
+    p.add_argument("--print_freq", type=int, default=200)
+    p.add_argument("--eval_freq", type=int, default=1000)
+    p.add_argument("--save_freq", type=int, default=5000)
+    p.add_argument("--eval_samples", type=int, default=3,
+                   help="Stochastic samples averaged per eval batch")
+    p.add_argument("--device", type=str,
+                   default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
+
+
+# ─── Eval ──────────────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device,
+             eval_samples: int = 3) -> dict:
+    """Eval set MSE for arm, hand (averaged over `eval_samples` reparam draws),
+    and the no-correction baseline (delta_mu = delta_log_var = 0).
+    """
+    policy.eval()
+    # Stable reparam noise across eval calls
+    g_state = torch.random.get_rng_state()
+    torch.manual_seed(42)
+
+    sums = {"arm": 0.0, "hand_full": 0.0, "hand_no_corr": 0.0, "n": 0}
+
+    for batch in loader:
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        gt = batch["gt_action"]                # (B, 12)
+        arm_gt = gt[:, :6]
+        hand_gt = gt[:, 6:]
+
+        # ── Full policy with delta — average MSE over `eval_samples` draws ──
+        hand_mse_acc = 0.0
+        arm_pred = None
+        for _ in range(eval_samples):
+            out = policy(
+                img_main=batch["img_main"],
+                img_extra=batch["img_extra"],
+                state=batch["state"],
+                past_hand_win=batch["past_hand_win"],
+            )
+            arm_pred = out["arm_action"]       # arm is deterministic, same every draw
+            hand_mse_acc += F.mse_loss(out["hand_action"], hand_gt).item()
+        hand_mse_full = hand_mse_acc / eval_samples
+        arm_mse = F.mse_loss(arm_pred, arm_gt).item()
+
+        # ── No-correction baseline (delta = 0) ──
+        out_zero = policy(
+            img_main=batch["img_main"],
+            img_extra=batch["img_extra"],
+            state=batch["state"],
+            past_hand_win=batch["past_hand_win"],
+            zero_delta=True,
+        )
+        hand_mse_no_corr = F.mse_loss(out_zero["hand_action"], hand_gt).item()
+
+        B = gt.shape[0]
+        sums["arm"] += arm_mse * B
+        sums["hand_full"] += hand_mse_full * B
+        sums["hand_no_corr"] += hand_mse_no_corr * B
+        sums["n"] += B
+
+    torch.random.set_rng_state(g_state)
+    policy.train()
+
+    n = sums["n"]
+    return {
+        "arm_mse": sums["arm"] / n,
+        "hand_mse_full": sums["hand_full"] / n,
+        "hand_mse_no_correction": sums["hand_no_corr"] / n,
+        "total_mse": (sums["arm"] + sums["hand_full"]) / n,
+    }
+
+
+# ─── Checkpoint ────────────────────────────────────────────────────────────────
+
+
+def save_checkpoint(policy, optimizer, step, output_dir, state_mean, state_std, args):
+    os.makedirs(output_dir, exist_ok=True)
+    state = {
+        "model": strip_vae_state_dict(policy.state_dict()),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "state_mean": state_mean,
+        "state_std": state_std,
+        "args": vars(args),
+    }
+    torch.save(state, os.path.join(output_dir, f"checkpoint-{step}.pth"))
+    torch.save(state, os.path.join(output_dir, "checkpoint.pth"))
+
+
+# ─── Plot ──────────────────────────────────────────────────────────────────────
+
+
+def save_training_curves(history, output_dir, args):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available, skipping training curves")
+        return
+
+    from numpy import convolve, ones
+
+    steps = history["steps"]
+    eval_steps = history["eval_steps"]
+    window = max(1, min(100, len(steps) // 10))
+    kernel = ones(window) / window
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(
+        f"BC Training Curves  (lr={args.lr}, batch={args.batch_size}, "
+        f"steps={args.total_steps})",
+        fontsize=13,
+    )
+
+    def smooth(arr):
+        return convolve(arr, kernel, mode="valid") if window > 1 and len(arr) >= window else arr
+
+    # 1. Total train loss
+    ax = axes[0, 0]
+    ax.plot(steps, history["train_total"], alpha=0.3, color="blue", linewidth=0.5)
+    sm = smooth(history["train_total"])
+    ax.plot(steps[:len(sm)], sm, color="blue", linewidth=1.5, label="Smoothed")
+    ax.set_xlabel("Step"); ax.set_ylabel("Loss")
+    ax.set_title("Train Total Loss (arm_mse + hand_mse)")
+    ax.grid(True, alpha=0.3); ax.legend()
+
+    # 2. Train arm vs hand
+    ax = axes[0, 1]
+    sm_arm = smooth(history["train_arm"])
+    sm_hand = smooth(history["train_hand"])
+    ax.plot(steps[:len(sm_arm)], sm_arm, color="green", linewidth=1.5, label="arm (smoothed)")
+    ax.plot(steps[:len(sm_hand)], sm_hand, color="red", linewidth=1.5, label="hand (smoothed)")
+    ax.set_xlabel("Step"); ax.set_ylabel("MSE")
+    ax.set_title("Train arm vs hand MSE")
+    ax.grid(True, alpha=0.3); ax.legend()
+
+    # 3. Val arm + hand_full + no_correction baseline
+    ax = axes[0, 2]
+    if eval_steps:
+        ax.plot(eval_steps, history["val_arm"], "go-", markersize=4, label="val arm")
+        ax.plot(eval_steps, history["val_hand_full"], "ro-", markersize=4, label="val hand (delta)")
+        ax.plot(eval_steps, history["val_hand_no_corr"], "k--", linewidth=1, label="val hand (no corr)")
+    ax.set_xlabel("Step"); ax.set_ylabel("MSE")
+    ax.set_title("Validation MSE")
+    ax.grid(True, alpha=0.3); ax.legend()
+
+    # 4. Val total
+    ax = axes[1, 0]
+    if eval_steps:
+        ax.plot(eval_steps, history["val_total"], "bo-", markersize=4, label="val total")
+    ax.set_xlabel("Step"); ax.set_ylabel("Loss")
+    ax.set_title("Validation Total MSE")
+    ax.grid(True, alpha=0.3); ax.legend()
+
+    # 5. LR schedule
+    ax = axes[1, 1]
+    ax.plot(steps, history["train_lr"], color="teal", linewidth=1.5)
+    ax.set_xlabel("Step"); ax.set_ylabel("Learning Rate")
+    ax.set_title("Learning Rate (Cosine)")
+    ax.grid(True, alpha=0.3)
+
+    # 6. Hand-MSE delta vs no-correction (proxy for "did vision help?")
+    ax = axes[1, 2]
+    if eval_steps:
+        improvement = [b - a for a, b in zip(history["val_hand_full"], history["val_hand_no_corr"])]
+        ax.plot(eval_steps, improvement, "mo-", markersize=4)
+        ax.axhline(0, color="gray", linestyle="--", linewidth=1)
+    ax.set_xlabel("Step"); ax.set_ylabel("hand_no_corr - hand_full")
+    ax.set_title("Vision Improvement Over No-Correction Baseline")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig_path = os.path.join(output_dir, "training_curves.png")
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Training curves saved to {fig_path}")
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+
+def main():
+    args = get_args()
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── State stats from train split (one pass) ──
+    print(f"Computing state mean/std from {args.train_dir} ...")
+    state_mean, state_std = compute_state_stats(args.train_dir)
+    print(f"  state_mean[:6] = {state_mean[:6].tolist()}")
+    print(f"  state_std [:6] = {state_std[:6].tolist()}")
+
+    # ── Datasets ──
+    train_ds = BCDataset(
+        args.train_dir, state_mean=state_mean, state_std=state_std,
+        window_size=args.window_size,
+    )
+    test_ds = BCDataset(
+        args.test_dir, state_mean=state_mean, state_std=state_std,
+        window_size=args.window_size,
+    )
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        drop_last=True, num_workers=args.num_workers, pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+    )
+
+    # ── Model: frozen VAE wrapped inside BCPolicy ──
+    vae = build_and_freeze_vae(args.vae_ckpt)
+    policy = BCPolicy(
+        vae=vae,
+        state_dim=24,
+        feat_dim=args.feat_dim,
+        fusion_dim=args.fusion_dim,
+    ).to(device)
+
+    n_total = sum(p.numel() for p in policy.parameters())
+    n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    print(f"Policy parameters: total={n_total:,}  trainable={n_train:,}  "
+          f"frozen={n_total - n_train:,}")
+
+    # ── Optimizer & LR schedule (no beta — BC has no KL) ──
+    optimizer = torch.optim.AdamW(
+        trainable_params(policy), lr=args.lr, weight_decay=args.weight_decay,
+    )
+    lr_schedule = cosine_scheduler(
+        args.lr, args.min_lr, args.total_steps, warmup_steps=args.warmup_steps,
+    )
+
+    # ── Step-0 sanity check ──
+    # 1) Verify zero-init: delta heads must output exactly 0 on a real batch.
+    # 2) Then run the eval. Note hand_mse_full and hand_mse_no_correction will
+    #    differ slightly here due to stochastic reparam noise (3-sample avg vs
+    #    1-sample) — that's expected, not a bug.
+    print("\n[Sanity] Step-0 zero-init check:")
+    policy.eval()
+    with torch.no_grad():
+        peek_batch = next(iter(test_loader))
+        peek_batch = {k: v.to(device) for k, v in peek_batch.items()}
+        peek_out = policy(
+            img_main=peek_batch["img_main"],
+            img_extra=peek_batch["img_extra"],
+            state=peek_batch["state"],
+            past_hand_win=peek_batch["past_hand_win"],
+        )
+    dmu_max = peek_out["delta_mu"].abs().max().item()
+    dlv_max = peek_out["delta_log_var"].abs().max().item()
+    print(f"  |delta_mu|_max     = {dmu_max:.2e}  (must be 0.00e+00)")
+    print(f"  |delta_log_var|_max = {dlv_max:.2e}  (must be 0.00e+00)")
+    assert dmu_max == 0.0 and dlv_max == 0.0, "zero-init of delta heads is broken"
+    policy.train()
+
+    print("[Sanity] Step-0 evaluation:")
+    init_eval = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+    print(f"  arm_mse                = {init_eval['arm_mse']:.6f}")
+    print(f"  hand_mse_full          = {init_eval['hand_mse_full']:.6f}")
+    print(f"  hand_mse_no_correction = {init_eval['hand_mse_no_correction']:.6f}")
+    print()
+
+    # ── Training loop ──
+    history = {
+        "steps": [], "train_total": [], "train_arm": [], "train_hand": [], "train_lr": [],
+        "eval_steps": [], "val_arm": [], "val_hand_full": [],
+        "val_hand_no_corr": [], "val_total": [],
+    }
+
+    train_iter = iter(train_loader)
+    policy.train()
+    print(f"Training for {args.total_steps} steps  "
+          f"(train={len(train_ds)}, test={len(test_ds)})\n")
+    t0 = time.time()
+
+    for step in range(args.total_steps):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_schedule[step]
+
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        gt = batch["gt_action"]
+
+        out = policy(
+            img_main=batch["img_main"],
+            img_extra=batch["img_extra"],
+            state=batch["state"],
+            past_hand_win=batch["past_hand_win"],
+        )
+        arm_loss = F.mse_loss(out["arm_action"], gt[:, :6])
+        hand_loss = F.mse_loss(out["hand_action"], gt[:, 6:])
+        loss = arm_loss + hand_loss
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable_params(policy), args.clip_grad)
+        optimizer.step()
+
+        history["steps"].append(step)
+        history["train_total"].append(loss.item())
+        history["train_arm"].append(arm_loss.item())
+        history["train_hand"].append(hand_loss.item())
+        history["train_lr"].append(lr_schedule[step])
+
+        if step % args.print_freq == 0:
+            elapsed = time.time() - t0
+            print(f"[Step {step:>5d}] total={loss.item():.6f}  "
+                  f"arm={arm_loss.item():.6f}  hand={hand_loss.item():.6f}  "
+                  f"lr={lr_schedule[step]:.2e}  ({elapsed:.0f}s)")
+
+        if step > 0 and step % args.eval_freq == 0:
+            ev = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+            history["eval_steps"].append(step)
+            history["val_arm"].append(ev["arm_mse"])
+            history["val_hand_full"].append(ev["hand_mse_full"])
+            history["val_hand_no_corr"].append(ev["hand_mse_no_correction"])
+            history["val_total"].append(ev["total_mse"])
+            improved = ev["hand_mse_no_correction"] - ev["hand_mse_full"]
+            print(f"           val arm={ev['arm_mse']:.6f}  "
+                  f"hand={ev['hand_mse_full']:.6f}  "
+                  f"no_corr={ev['hand_mse_no_correction']:.6f}  "
+                  f"vision_gain={improved:+.6f}")
+
+        if step > 0 and step % args.save_freq == 0:
+            save_checkpoint(policy, optimizer, step, args.output_dir,
+                            state_mean, state_std, args)
+            print(f"           checkpoint saved -> {args.output_dir}/checkpoint-{step}.pth")
+
+    # ── Final eval + save ──
+    save_checkpoint(policy, optimizer, args.total_steps, args.output_dir,
+                    state_mean, state_std, args)
+    ev = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+    history["eval_steps"].append(args.total_steps)
+    history["val_arm"].append(ev["arm_mse"])
+    history["val_hand_full"].append(ev["hand_mse_full"])
+    history["val_hand_no_corr"].append(ev["hand_mse_no_correction"])
+    history["val_total"].append(ev["total_mse"])
+
+    print(f"\nFinal val: arm={ev['arm_mse']:.6f}  "
+          f"hand={ev['hand_mse_full']:.6f}  "
+          f"no_corr={ev['hand_mse_no_correction']:.6f}  "
+          f"vision_gain={ev['hand_mse_no_correction'] - ev['hand_mse_full']:+.6f}")
+    print(f"  Vision-corrected hand prediction "
+          f"{'BEATS' if ev['hand_mse_full'] < ev['hand_mse_no_correction'] else 'DOES NOT beat'} "
+          f"the no-correction baseline.")
+
+    save_training_curves(history, args.output_dir, args)
+    print(f"\nDone! Checkpoints + figures saved to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
