@@ -53,27 +53,6 @@ JOINT_NAMES = ["thumb_rot", "thumb_bend", "index", "middle", "ring", "pinky"]
 DEFAULT_INIT = [0.4, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
-def detect_data_mode(test_dir):
-    """Auto-detect whether actions are absolute or delta from per-dim mean."""
-    files = sorted(glob.glob(os.path.join(test_dir, "trajectory_*_demo_expert.pt")))
-    if not files:
-        return "absolute"
-    data = torch.load(files[0], map_location="cpu", weights_only=False)
-    actions = data["actions"][:, 0, 6:12].float()
-    per_dim_abs_mean = actions.mean(dim=0).abs()
-    return "delta" if per_dim_abs_mean.max().item() < 0.05 else "absolute"
-
-
-def integrate_deltas(deltas, initial_pose):
-    """Convert (T, 6) delta actions to absolute via cumsum from initial_pose.
-
-    Returns (T, 6) where result[t] = initial_pose + sum(deltas[0:t+1]).
-    """
-    if isinstance(deltas, np.ndarray):
-        return initial_pose + np.cumsum(deltas, axis=0)
-    return initial_pose + deltas.cumsum(dim=0)
-
-
 def infer_model_args(state_dict, default_window_size=8):
     """Infer HandActionVAE constructor kwargs from a checkpoint's state_dict.
 
@@ -124,13 +103,9 @@ def infer_model_args(state_dict, default_window_size=8):
     return kwargs
 
 
-def load_trajectory(path, load_states=False):
+def load_trajectory(path):
     data = torch.load(path, map_location="cpu", weights_only=False)
-    actions = data["actions"][:, 0, 6:12].float()
-    if load_states:
-        states = data["curr_obs"]["states"][:, 0, 0:6].float()  # observed hand pose
-        return actions, states
-    return actions
+    return data["actions"][:, 0, 6:12].float()
 
 
 # ─── Rollout functions ─────────────────────────────────────────────────────────
@@ -174,51 +149,32 @@ def rollout_autoregressive(model, seed, total_steps, window_size, deterministic)
 
 # ─── Mode 1: GT comparison ────────────────────────────────────────────────────
 
-def eval_gt_comparison(model, traj_path, window_size, deterministic, num_samples, verbose,
-                       data_mode="absolute"):
+def eval_gt_comparison(model, traj_path, window_size, deterministic, num_samples, verbose):
     """Compare model predictions against ground truth trajectory."""
-    is_delta = (data_mode == "delta")
-
-    if is_delta:
-        delta_actions, states = load_trajectory(traj_path, load_states=True)
-        initial_pose = states[0]  # observed hand pose at frame 0
-        T = delta_actions.shape[0]
-        # Rollouts operate in delta space (model was trained on deltas)
-        pred_tf_delta = rollout_teacher_forcing(model, delta_actions, window_size, deterministic=True)
-        ar_runs_delta = []
-        for _ in range(num_samples):
-            pred_ar = rollout_autoregressive(model, delta_actions[:window_size], T, window_size, deterministic)
-            ar_runs_delta.append(pred_ar.numpy())
-        ar_runs_delta = np.stack(ar_runs_delta)  # (num_samples, T, 6)
-        # Convert everything to absolute for metrics and plotting
-        ip = initial_pose.numpy()
-        gt = integrate_deltas(delta_actions.numpy(), ip)
-        pred_tf = integrate_deltas(pred_tf_delta.numpy(), ip)
-        ar_runs = np.stack([integrate_deltas(r, ip) for r in ar_runs_delta])
-    else:
-        gt_t = load_trajectory(traj_path)
-        T = gt_t.shape[0]
-        pred_tf_t = rollout_teacher_forcing(model, gt_t, window_size, deterministic=True)
-        ar_runs_list = []
-        for _ in range(num_samples):
-            pred_ar = rollout_autoregressive(model, gt_t[:window_size], T, window_size, deterministic)
-            ar_runs_list.append(pred_ar.numpy())
-        gt = gt_t.numpy()
-        pred_tf = pred_tf_t.numpy()
-        ar_runs = np.stack(ar_runs_list)
-
+    gt = load_trajectory(traj_path)
+    T = gt.shape[0]
     traj_id = os.path.basename(traj_path).split("trajectory_")[1].split("_")[0]
-    ar_mean = ar_runs.mean(axis=0)
-    ar_std = ar_runs.std(axis=0)
-    mse_tf = ((pred_tf - gt) ** 2).mean(axis=1)
-    mse_ar_mean = ((ar_mean - gt) ** 2).mean(axis=1)
+
+    # Teacher forcing (always deterministic for clean comparison)
+    pred_tf = rollout_teacher_forcing(model, gt, window_size, deterministic=True)
+    mse_tf = ((pred_tf - gt) ** 2).mean(dim=1).numpy()
+
+    # Autoregressive: run num_samples times
+    ar_runs = []
+    for _ in range(num_samples):
+        pred_ar = rollout_autoregressive(model, gt[:window_size], T, window_size, deterministic)
+        ar_runs.append(pred_ar.numpy())
+    ar_runs = np.stack(ar_runs)  # (num_samples, T, 6)
+    ar_mean = ar_runs.mean(axis=0)  # (T, 6)
+    ar_std = ar_runs.std(axis=0)    # (T, 6)
+    mse_ar_mean = ((ar_mean - gt.numpy()) ** 2).mean(axis=1)
+
     copy_mse = ((gt[window_size:] - gt[window_size - 1:-1]) ** 2).mean().item()
 
     if verbose:
         tf_region = mse_tf[window_size:].mean()
         ar_region = mse_ar_mean[window_size:].mean()
-        print(f"\nTrajectory {traj_id}: {T} steps (seed={window_size}, predict={T - window_size})"
-              f"  [{'delta→abs' if is_delta else 'absolute'}]")
+        print(f"\nTrajectory {traj_id}: {T} steps (seed={window_size}, predict={T - window_size})")
         print(f"  Teacher Forcing MSE:         {tf_region:.6f}")
         print(f"  Autoregressive MSE (mean):   {ar_region:.6f}  ({num_samples} samples)")
         print(f"  Copy Baseline MSE:           {copy_mse:.6f}")
@@ -226,8 +182,8 @@ def eval_gt_comparison(model, traj_path, window_size, deterministic, num_samples
             print(f"  AR prediction std (mean):    {ar_std[window_size:].mean():.6f}")
 
     return {
-        "traj_id": traj_id, "T": T, "gt": gt,
-        "pred_tf": pred_tf, "mse_tf": mse_tf,
+        "traj_id": traj_id, "T": T, "gt": gt.numpy(),
+        "pred_tf": pred_tf.numpy(), "mse_tf": mse_tf,
         "ar_runs": ar_runs, "ar_mean": ar_mean, "ar_std": ar_std,
         "mse_ar_mean": mse_ar_mean, "copy_mse": copy_mse,
         "num_samples": num_samples,
@@ -236,23 +192,15 @@ def eval_gt_comparison(model, traj_path, window_size, deterministic, num_samples
 
 # ─── Mode 2: Free-run ─────────────────────────────────────────────────────────
 
-def eval_free_run(model, seed, max_steps, window_size, deterministic, num_samples,
-                  label="free", data_mode="absolute", initial_pose=None):
+def eval_free_run(model, seed, max_steps, window_size, deterministic, num_samples, label="free"):
     """Generate trajectories from seed without ground truth."""
-    is_delta = (data_mode == "delta")
     runs = []
     for _ in range(num_samples):
         traj = rollout_autoregressive(model, seed, max_steps, window_size, deterministic)
         runs.append(traj.numpy())
     runs = np.stack(runs)  # (num_samples, max_steps, 6)
 
-    # Convert delta rollouts to absolute for plotting
-    if is_delta and initial_pose is not None:
-        ip = initial_pose.numpy() if isinstance(initial_pose, torch.Tensor) else initial_pose
-        runs = np.stack([integrate_deltas(r, ip) for r in runs])
-
-    print(f"\nFree-run: {max_steps} steps, {num_samples} samples"
-          f"  [{'delta→abs' if is_delta else 'absolute'}]")
+    print(f"\nFree-run: {max_steps} steps, {num_samples} samples")
     print(f"  Seed: {seed[0].numpy().round(3)}")
     print(f"  Final state (mean): {runs[:, -1, :].mean(axis=0).round(3)}")
     print(f"  Final state (std):  {runs[:, -1, :].std(axis=0).round(3)}")
@@ -381,14 +329,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=5, help="Number of stochastic rollouts")
 
     parser.add_argument("--save_plot", action="store_true")
-    parser.add_argument("--data_mode", choices=["auto", "absolute", "delta"], default="auto",
-                        help="Action space of loaded data. 'auto' sniffs from per-dim mean.")
     args = parser.parse_args()
-
-    # Resolve data_mode
-    if args.data_mode == "auto":
-        args.data_mode = detect_data_mode(args.test_dir)
-        print(f"Auto-detected data mode: {args.data_mode}")
 
     # Load model — infer architecture from the checkpoint's state_dict so we
     # don't have to know hidden_dim/latent_dim/encoder_type ahead of time.
@@ -416,22 +357,14 @@ def main():
 
     if args.free_run:
         # ── Free-run mode ──
-        initial_pose = None  # only needed for delta mode
         if args.init_state:
-            if args.data_mode == "delta":
-                print("WARNING: --init_state with delta mode is not recommended. "
-                      "Use --traj_id to seed from a real trajectory.")
             seed = torch.tensor(args.init_state).float().unsqueeze(0)
             label = "custom"
         elif args.traj_id:
             all_files = sorted(glob.glob(os.path.join(args.test_dir, "trajectory_*_demo_expert.pt")))
             matches = [f for f in all_files if f"trajectory_{args.traj_id[0]}_" in f]
             if matches:
-                if args.data_mode == "delta":
-                    gt, states = load_trajectory(matches[0], load_states=True)
-                    initial_pose = states[0]
-                else:
-                    gt = load_trajectory(matches[0])
+                gt = load_trajectory(matches[0])
                 seed = gt[:args.window_size]
                 label = f"seed_traj{args.traj_id[0]}"
             else:
@@ -443,8 +376,7 @@ def main():
             label = "default"
 
         result = eval_free_run(model, seed, args.max_steps, args.window_size,
-                               deterministic, args.num_samples, label,
-                               data_mode=args.data_mode, initial_pose=initial_pose)
+                               deterministic, args.num_samples, label)
 
         # Save trajectory data
         os.makedirs(args.output_dir, exist_ok=True)
@@ -475,8 +407,7 @@ def main():
         results = []
         for f in files:
             r = eval_gt_comparison(model, f, args.window_size, deterministic,
-                                   args.num_samples, verbose=True,
-                                   data_mode=args.data_mode)
+                                   args.num_samples, verbose=True)
             results.append(r)
             if args.save_plot:
                 plot_gt_comparison(r, args.output_dir, args.window_size)

@@ -1,12 +1,19 @@
 """
-Diagnostic metrics for the delta-action Hand Action VAE sweep.
+Diagnostic metrics for the Hand Action VAE.
 
-Computes per-checkpoint:
+Re-evaluates dim_2_best vs dim_32 reference using metrics that actually
+reflect "information preserved", instead of the misleading "finger terminal
+mean from free-run rollout" used in earlier sweeps.
+
+Computes:
   0. PCA explained variance on flattened (8, 6) windows  — linear upper bound
   A. Latent linear-decodability R²                       — VAE encoder vs PCA
   B. Active latent dim count (per-dim KL > 0.01)         — utilization
   C. GT comparison per-step MSE on test trajectories     — AR fidelity
   D. Decoder reachability (optimal-z MSE)                — decoder ceiling
+     For each target action, find z* via gradient descent that minimizes
+     ||decoder(z*) - target||². If this floor is much smaller than val_recon,
+     the decoder is fine and the encoder/latent is the bottleneck.
 """
 
 import importlib.util
@@ -17,28 +24,20 @@ import torch
 
 # ───────────────────────────── Config ─────────────────────────────
 
-DATA_ROOT = Path("/home/yxy/VQ-VLA/data/delta_action_20260327_11_10_43")
+DATA_ROOT = Path("/home/yxy/data/20260327-11:10:43/demos/success")
 WINDOW_SIZE = 8
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-OUT = Path("outputs/delta")
-
 CHECKPOINTS = {
-    # ── Sweep 1: Architecture ──
-    "A  h256 d1 mlp (baseline)":      OUT / "arch_sweep/A_h256_d1_mlp/checkpoint.pth",
-    "B  h512 d1 mlp":                 OUT / "arch_sweep/B_h512_d1_mlp/checkpoint.pth",
-    "C  h256 d2 mlp":                 OUT / "arch_sweep/C_h256_d2_mlp/checkpoint.pth",
-    "D  h512 d2 mlp":                 OUT / "arch_sweep/D_h512_d2_mlp/checkpoint.pth",
-    "E  h256 d1 cnn":                 OUT / "arch_sweep/E_h256_d1_cnn/checkpoint.pth",
-    # ── Sweep 2: Loss ──
-    "F  recon_aux=0.1":               OUT / "loss_sweep/F_recon_only/checkpoint.pth",
-    "G  free_bits=0.5":               OUT / "loss_sweep/G_freebits_only/checkpoint.pth",
-    "H  both":                        OUT / "loss_sweep/H_both/checkpoint.pth",
-    # ── Sweep 3: Recon weight ──
-    "W005  recon_aux=0.05":           OUT / "recon_sweep/W005/checkpoint.pth",
-    "W030  recon_aux=0.30":           OUT / "recon_sweep/W030/checkpoint.pth",
-    "W050  recon_aux=0.50":           OUT / "recon_sweep/W050/checkpoint.pth",
-    "W100  recon_aux=1.00":           OUT / "recon_sweep/W100/checkpoint.pth",
+    # recon_aux_weight sweep — all dim_2_best baseline (h256 d1 mlp β=0.001 noise=0.01 20k)
+    "W000  (baseline, no aux)":  "outputs/dim_2_arch_sweep/A_h256_d1_mlp/checkpoint.pth",
+    "W005  (recon_aux=0.05)":    "outputs/dim_2_recon_sweep/W005/checkpoint.pth",
+    "W010  (recon_aux=0.10)":    "outputs/dim_2_loss_sweep/F_recon_only/checkpoint.pth",
+    "W030  (recon_aux=0.30)":    "outputs/dim_2_recon_sweep/W030/checkpoint.pth",
+    "W050  (recon_aux=0.50)":    "outputs/dim_2_recon_sweep/W050/checkpoint.pth",
+    "W100  (recon_aux=1.00)":    "outputs/dim_2_recon_sweep/W100/checkpoint.pth",
+    # Reference point
+    "dim_32 ref (k=32)":         "outputs/hand_vae_noise_0.01/checkpoint.pth",
 }
 
 # ───────────────────────────── Loading ─────────────────────────────
@@ -73,9 +72,7 @@ def build_windows(trajs, window_size):
         for t in range(T):
             start = t - window_size + 1
             if start < 0:
-                # Zero-pad for delta data (auto-detect already done in dataset;
-                # here we hard-code zero pad since this script targets delta data)
-                pad = np.zeros((-start, actions.shape[1]))
+                pad = np.repeat(actions[0:1], -start, axis=0)
                 window = np.concatenate([pad, actions[0:t + 1]], axis=0)
             else:
                 window = actions[start:t + 1]
@@ -117,7 +114,13 @@ def encode_all(model, seq_windows: np.ndarray, batch_size=512):
 
 
 def linear_decodability_r2(mu: np.ndarray, X: np.ndarray):
-    """R² of best linear regression mu (N, k) → X (N, D)."""
+    """R² of best linear regression mu (N, k) → X (N, D).
+
+    Compare directly to PCA top-k explained variance ratio:
+      R² == top-k PCA → encoder matches linear PCA
+      R² >  top-k PCA → nonlinearity preserves more info than linear projection
+      R² <  top-k PCA → encoder is worse than PCA (improvement room!)
+    """
     mu_c = mu - mu.mean(axis=0, keepdims=True)
     X_c = X - X.mean(axis=0, keepdims=True)
     W, _, _, _ = np.linalg.lstsq(mu_c, X_c, rcond=None)
@@ -128,13 +131,16 @@ def linear_decodability_r2(mu: np.ndarray, X: np.ndarray):
 
 
 def active_dims(mu: np.ndarray, log_var: np.ndarray, threshold=0.01):
+    """Per-dim mean KL and count above threshold."""
     kl_per_dim = -0.5 * (1 + log_var - mu ** 2 - np.exp(log_var))
     kl_per_dim = kl_per_dim.mean(axis=0)
     return kl_per_dim, int((kl_per_dim > threshold).sum())
 
 
 @torch.no_grad()
-def actual_val_recon_per_target(model, seq_windows, targets, batch_size=512):
+def actual_val_recon_per_target(model, seq_windows: np.ndarray, targets: np.ndarray, batch_size=512):
+    """Per-target single-step MSE on the encoder→decoder path (deterministic, μ).
+    Returns (N,) numpy array of per-target MSE so we can do per-target comparisons."""
     out = []
     for i in range(0, len(seq_windows), batch_size):
         x = torch.from_numpy(seq_windows[i:i + batch_size]).float().to(DEVICE)
@@ -145,8 +151,16 @@ def actual_val_recon_per_target(model, seq_windows, targets, batch_size=512):
     return np.concatenate(out)
 
 
-def decoder_reachability(model, target_actions, n_iter=600, lr=0.05,
+def decoder_reachability(model, target_actions: np.ndarray, n_iter=600, lr=0.05,
                          batch_size=512, n_restarts=8):
+    """For each target, find z* by multi-restart Adam that minimizes
+    ||decoder(z*) - target||². Bypasses the encoder entirely. The resulting
+    min MSE is the **decoder's intrinsic floor** — the best the model could
+    possibly do if it had a perfect encoder.
+
+    Multi-restart is critical: random init can land in local minima, so we
+    take the min over n_restarts independent runs per target.
+    """
     saved = [p.requires_grad for p in model.parameters()]
     for p in model.parameters():
         p.requires_grad_(False)
@@ -155,10 +169,12 @@ def decoder_reachability(model, target_actions, n_iter=600, lr=0.05,
         N = targets_t.shape[0]
         latent_dim = model.latent_dim
         all_min_mse = []
+
         for i in range(0, N, batch_size):
             batch = targets_t[i:i + batch_size]
             best_mse = None
             for restart in range(n_restarts):
+                # Vary init spread across restarts so we explore different basins
                 spread = [0.1, 0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 0.3][restart % 8]
                 z = (torch.randn(batch.shape[0], latent_dim, device=DEVICE) * spread).requires_grad_(True)
                 opt = torch.optim.Adam([z], lr=lr)
@@ -181,23 +197,28 @@ def decoder_reachability(model, target_actions, n_iter=600, lr=0.05,
 
 @torch.no_grad()
 def gt_per_step_mse(model, trajs, window_size, n_samples=20):
-    """Batched AR rollout: per-step MSE vs GT."""
+    """Batched AR rollout: each trajectory's n_samples are run in parallel.
+    Per trajectory, seed = first window_size frames; rollout to real T;
+    compute MSE vs GT per step. Return mean MSE per step (averaged across trajs)."""
     all_mses = []
     for actions in trajs:
         T = actions.shape[0]
         if T <= window_size:
             continue
-        gt = torch.from_numpy(actions).float().to(DEVICE)
-        seed = gt[:window_size].unsqueeze(0).expand(n_samples, -1, -1).clone()
-        preds = [seed[:, i, :] for i in range(window_size)]
+        gt = torch.from_numpy(actions).float().to(DEVICE)              # (T, 6)
+        seed = gt[:window_size].unsqueeze(0).expand(n_samples, -1, -1).clone()  # (N, W, 6)
+        preds = [seed[:, i, :] for i in range(window_size)]            # list of (N, 6)
+
         for _ in range(window_size, T):
-            window = torch.stack(preds[-window_size:], dim=1)
-            next_pred = model.predict(window, deterministic=False)
+            window = torch.stack(preds[-window_size:], dim=1)          # (N, W, 6)
+            next_pred = model.predict(window, deterministic=False)     # (N, 6)
             preds.append(next_pred)
-        traj_pred = torch.stack(preds, dim=1)
+
+        traj_pred = torch.stack(preds, dim=1)                          # (N, T, 6)
         gt_b = gt.unsqueeze(0).expand(n_samples, -1, -1)
-        mse = ((traj_pred - gt_b) ** 2).mean(dim=2).mean(dim=0)
+        mse = ((traj_pred - gt_b) ** 2).mean(dim=2).mean(dim=0)        # (T,)
         all_mses.append(mse.cpu().numpy())
+
     max_len = max(len(m) for m in all_mses)
     padded = np.full((len(all_mses), max_len), np.nan)
     for i, m in enumerate(all_mses):
@@ -212,17 +233,17 @@ def main():
     train_dir = DATA_ROOT / "train"
     test_dir = DATA_ROOT / "test"
 
-    print("Loading delta-action trajectories...")
+    print("Loading trajectories...")
     train_trajs = load_trajectories(train_dir)
     test_trajs = load_trajectories(test_dir)
     train_flat, train_seq, train_targets = build_windows(train_trajs, WINDOW_SIZE)
     test_flat, test_seq, test_targets = build_windows(test_trajs, WINDOW_SIZE)
-    print(f"  train: {len(train_trajs)} trajs -> {train_flat.shape[0]} windows")
-    print(f"  test:  {len(test_trajs)} trajs -> {test_flat.shape[0]} windows")
+    print(f"  train: {len(train_trajs)} trajs → {train_flat.shape[0]} windows")
+    print(f"  test:  {len(test_trajs)} trajs → {test_flat.shape[0]} windows")
 
-    # PCA bounds
+    # ── PCA bounds ────────────────────────────────────────────────
     print("\n" + "=" * 70)
-    print("[0] PCA on flattened (8, 6) windows -- linear upper bound")
+    print("[0] PCA on flattened (8, 6) windows — linear upper bound")
     print("=" * 70)
     ratios = pca_explained(train_flat)
     cum = np.cumsum(ratios) * 100
@@ -230,29 +251,35 @@ def main():
         if k <= len(ratios):
             print(f"  top-{k:2d}: {cum[k-1]:6.3f}%")
 
-    # Per-model metrics
+    # ── Per-model metrics ─────────────────────────────────────────
     summary = []
     for label, ckpt_path in CHECKPOINTS.items():
         print("\n" + "=" * 70)
         print(f"Model: {label}")
         print(f"  ckpt: {ckpt_path}")
         print("=" * 70)
-        if not ckpt_path.exists():
-            print("  [skip] checkpoint not found")
+        if not Path(ckpt_path).exists():
+            print(f"  [skip] checkpoint not found")
             continue
 
-        model, kwargs = load_model(ckpt_path)
+        model, kwargs = load_model(Path(ckpt_path))
         k = kwargs["latent_dim"]
         print(f"  hidden={kwargs['hidden_dim']}, latent={k}, encoder={kwargs['encoder_type']}")
 
         mu_tr, lv_tr = encode_all(model, train_seq)
-        print(f"  encoded {mu_tr.shape[0]} train windows -> mu {mu_tr.shape}")
+        print(f"  encoded {mu_tr.shape[0]} train windows → mu {mu_tr.shape}")
 
         # [A] Linear decodability vs PCA bound
         r2_tr = linear_decodability_r2(mu_tr, train_flat) * 100
         pca_bound = cum[k - 1]
-        print(f"\n  [A] Linear decodability R² vs PCA top-{k} bound = {pca_bound:.2f}%")
+        print(f"\n  [A] Linear decodability R²  vs  PCA top-{k} bound = {pca_bound:.2f}%")
         print(f"      VAE encoder R² (train): {r2_tr:6.3f}%   gap: {pca_bound - r2_tr:+.2f} pts")
+        if r2_tr < pca_bound - 1.0:
+            print(f"      → encoder is BELOW linear PCA — improvement room")
+        elif r2_tr > pca_bound + 1.0:
+            print(f"      → encoder beats linear PCA (nonlinearity helps)")
+        else:
+            print(f"      → encoder ≈ linear PCA")
 
         # [B] Active dims
         kl_per_dim, n_active = active_dims(mu_tr, lv_tr, threshold=0.01)
@@ -260,6 +287,11 @@ def main():
         print(f"      Active: {n_active} / {k}")
         if k <= 8:
             print(f"      Per-dim KL: {np.round(kl_per_dim, 4).tolist()}")
+        else:
+            sorted_kl = np.sort(kl_per_dim)[::-1]
+            print(f"      KL distribution (top→bottom): top-1={sorted_kl[0]:.4f}, "
+                  f"top-5={sorted_kl[4]:.4f}, top-16={sorted_kl[15]:.4f}, "
+                  f"min={sorted_kl[-1]:.5f}")
 
         # [C] GT per-step MSE
         per_step = gt_per_step_mse(model, test_trajs, WINDOW_SIZE, n_samples=20)
@@ -273,32 +305,38 @@ def main():
         print(f"      mid    (steps 13-22): {mid:.6f}")
         print(f"      late   (steps 23+):   {late:.6f}")
 
-        # [D] Decoder reachability
+        # [D] Decoder reachability (THE key diagnostic)
+        # First measure per-target actual recon (with the encoder)
         actual_per_target = actual_val_recon_per_target(model, test_seq, test_targets)
         actual_mean = float(actual_per_target.mean())
+
+        # Then measure decoder floor with multi-restart optimization
         floor_per_target = decoder_reachability(model, test_targets, n_iter=600, lr=0.05, n_restarts=8)
         floor_mean = float(floor_per_target.mean())
         floor_median = float(np.median(floor_per_target))
         floor_p95 = float(np.quantile(floor_per_target, 0.95))
+
+        # Per-target comparison: how often does decoder beat the encoder's choice?
         pairwise_ratio = floor_per_target / np.maximum(actual_per_target, 1e-9)
         frac_dec_better = float((floor_per_target < actual_per_target * 0.5).mean())
         median_ratio = float(np.median(pairwise_ratio))
 
-        print(f"\n  [D] Decoder reachability -- multi-restart optimal z*:")
-        print(f"      Actual recon  (encoder mu): mean={actual_mean:.6f}")
-        print(f"      Decoder floor (best z*):    mean={floor_mean:.6f}, median={floor_median:.6f}, p95={floor_p95:.6f}")
+        print(f"\n  [D] Decoder reachability — multi-restart optimal z*:")
+        print(f"      Actual recon  (encoder μ): mean={actual_mean:.6f}, median={float(np.median(actual_per_target)):.6f}")
+        print(f"      Decoder floor (best z*):   mean={floor_mean:.6f}, median={floor_median:.6f}, p95={floor_p95:.6f}")
         print(f"      Per-target median ratio (floor/actual): {median_ratio:.3f}")
-        print(f"      Fraction where decoder could do >=2x better: {frac_dec_better*100:.1f}%")
+        print(f"      Fraction of targets where decoder could do ≥2× better: {frac_dec_better*100:.1f}%")
 
+        # Median-based verdict (robust to optimization outliers)
         if floor_median < actual_mean * 0.05:
-            verdict = "DECODER fine -- ENCODER bottleneck"
+            verdict = "DECODER fine — ENCODER bottleneck (R² fix will help)"
         elif floor_median < actual_mean * 0.3:
-            verdict = "DECODER mostly fine -- encoder is main bottleneck"
+            verdict = "DECODER mostly fine — encoder is the main bottleneck"
         elif floor_median > actual_mean * 0.7:
-            verdict = "DECODER weak -- needs more capacity"
+            verdict = "DECODER weak — needs more capacity"
         else:
-            verdict = "MIXED -- both encoder and decoder contribute"
-        print(f"      -> Verdict: {verdict}")
+            verdict = "MIXED — both encoder and decoder contribute"
+        print(f"      → Verdict: {verdict}")
 
         summary.append({
             "label": label, "k": k, "r2": r2_tr, "pca_bound": pca_bound,
@@ -307,11 +345,11 @@ def main():
             "frac_dec_better": frac_dec_better, "verdict": verdict,
         })
 
-    # Summary table
+    # ── Verdict ─────────────────────────────────────────────────────
     print("\n" + "=" * 70)
-    print("SUMMARY (delta-action sweep)")
+    print("SUMMARY")
     print("=" * 70)
-    print(f"{'model':<32} {'k':>3} {'R2':>7} {'active':>8} {'AR MSE':>10} "
+    print(f"{'model':<32} {'k':>3} {'R²':>7} {'active':>8} {'AR MSE':>10} "
           f"{'enc recon':>10} {'dec floor med':>14}")
     for s in summary:
         print(f"{s['label']:<32} {s['k']:>3}  "
@@ -320,7 +358,8 @@ def main():
               f"{s['ar_mse']:.6f} "
               f"{s['actual_recon']:.6f}    "
               f"{s['floor_median']:.6f}")
-        print(f"{'':<32} -> {s['verdict']}")
+        print(f"{'':<32} → {s['verdict']}")
+        print(f"{'':<32}   ({s['frac_dec_better']*100:.1f}% of targets reachable ≥2× better via z*)")
 
 
 if __name__ == "__main__":

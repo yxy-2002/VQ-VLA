@@ -5,9 +5,7 @@ Each sample is a (window, target) pair:
   window: (window_size, 6) past hand actions [t-7 : t]
   target: (6,) ground truth hand action at t+1
 
-Padding behavior is auto-detected from the data:
-  - Absolute actions (per-dim |mean| > 0.05): pad with first frame
-  - Delta actions (per-dim |mean| < 0.05): pad with zeros (= "no motion before t=0")
+Zero-pads the beginning of each trajectory if fewer than window_size frames available.
 For the last frame of each trajectory, target = action at t (hold).
 """
 
@@ -35,33 +33,25 @@ class HandActionWindowDataset(Dataset):
         self.noise_std = noise_std
         self.samples = []  # list of (window, target) tensors
 
-        # First pass: load all trajectories' actions
-        all_actions = []
         for f in traj_files:
             data = torch.load(f, map_location="cpu", weights_only=False)
-            all_actions.append(data["actions"][:, 0, 6:12].float())  # (T, 6)
-
-        # Auto-detect action mode from per-dim mean
-        concat = torch.cat(all_actions, dim=0)
-        per_dim_abs_mean = concat.mean(dim=0).abs()
-        self.is_delta = bool(per_dim_abs_mean.max().item() < 0.05)
-        pad_mode = "zero" if self.is_delta else "first_frame"
-
-        # Second pass: build sliding-window samples
-        for actions in all_actions:
+            actions = data["actions"][:, 0, 6:12].float()  # (T, 6) hand actions
             T = actions.shape[0]
+
             for t in range(T):
+                # Build window [t - window_size + 1 : t + 1]
                 start = t - window_size + 1
                 if start < 0:
+                    # Pad with first frame (instead of zeros, to avoid false "hand open" signal)
                     pad_len = -start
-                    if self.is_delta:
-                        pad = torch.zeros(pad_len, actions.shape[1])
-                    else:
-                        pad = actions[0:1].expand(pad_len, -1)
-                    window = torch.cat([pad, actions[0:t + 1]], dim=0)
+                    window = torch.cat([
+                        actions[0:1].expand(pad_len, -1),
+                        actions[0:t + 1],
+                    ], dim=0)
                 else:
                     window = actions[start:t + 1]
 
+                # Target: action at t+1, or action at t for last frame
                 if t + 1 < T:
                     target = actions[t + 1]
                 else:
@@ -70,8 +60,7 @@ class HandActionWindowDataset(Dataset):
                 self.samples.append((window, target))
 
         print(f"Loaded {len(traj_files)} trajectories, {len(self.samples)} samples "
-              f"(window={window_size}, action_mode={'delta' if self.is_delta else 'absolute'}, "
-              f"pad={pad_mode}) from {data_dir}")
+              f"(window={window_size}) from {data_dir}")
 
     def __len__(self) -> int:
         return len(self.samples)
