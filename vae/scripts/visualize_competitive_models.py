@@ -37,10 +37,12 @@ def _load(path, name):
 _flow_eval = _load("scripts/eval_chunk_flow.py", "eval_chunk_flow")
 _ss_eval = _load("scripts/eval_state_space_chunk_prior.py", "eval_state_space_chunk_prior")
 _chunk_eval = _load("scripts/eval_chunk.py", "eval_chunk")
+_chunk_cvae_eval = _load("scripts/eval_chunk_cvae.py", "eval_chunk_cvae")
 _step_eval = _load("scripts/eval.py", "eval_step")
 
 HandActionVAE = _step_eval.HandActionVAE
 HandActionChunkVAE = _chunk_eval.HandActionChunkVAE
+HandActionChunkCVAE = _chunk_cvae_eval.HandActionChunkCVAE
 HandActionChunkFlow = _flow_eval.HandActionChunkFlow
 HandActionStateSpaceChunkPrior = _ss_eval.HandActionStateSpaceChunkPrior
 
@@ -177,6 +179,12 @@ def build_seed_window(actions, window_size):
     return np.concatenate([pad, actions[:take]], axis=0).astype(np.float32)
 
 
+def build_open_mean_seed(rows, window_size):
+    starts = np.stack([row["actions"][0] for row in rows], axis=0).astype(np.float32)
+    open_mean = starts.mean(axis=0)
+    return np.repeat(open_mean[None, :], window_size, axis=0).astype(np.float32)
+
+
 def padded_gt(actions, max_steps):
     if actions.shape[0] >= max_steps:
         return actions[:max_steps].astype(np.float32)
@@ -190,6 +198,19 @@ def load_model(spec, device):
         model = HandActionVAE(**_step_eval.infer_model_args(ckpt["model"])).to(device)
     elif spec["type"] == "chunk_vae":
         model = HandActionChunkVAE(**_chunk_eval.infer_model_args(ckpt["model"])).to(device)
+    elif spec["type"] == "chunk_cvae":
+        args = ckpt.get("args", {})
+        model = HandActionChunkCVAE(
+            action_dim=args.get("action_dim", 6),
+            window_size=args.get("window_size", 8),
+            future_horizon=args.get("future_horizon", 12),
+            hidden_dim=args.get("hidden_dim", 256),
+            latent_dim=args.get("latent_dim", 2),
+            beta=args.get("beta", 0.001),
+            encoder_type=args.get("encoder_type", "mlp"),
+            num_hidden_layers=args.get("num_hidden_layers", 1),
+            free_bits=args.get("free_bits", 0.0),
+        ).to(device)
     elif spec["type"] == "flow":
         model = HandActionChunkFlow(**_flow_eval.infer_model_args(ckpt)).to(device)
     elif spec["type"] == "state_space":
@@ -221,13 +242,27 @@ def rollout_from_seed(spec, model, seed_window, num_rollouts, max_steps):
 
     if spec["type"] == "chunk_vae":
         t = window_size
+        stride = int(spec.get("rollout_stride", model.future_horizon))
+        stride = max(1, min(stride, model.future_horizon))
         while t < max_steps:
             window = actions[:, t - window_size : t, :]
             pred = model.predict(window, deterministic=False)
-            take = min(model.future_horizon, max_steps - t)
+            take = min(stride, max_steps - t)
             actions[:, t : t + take, :] = pred[:, :take]
             t += take
         return actions.cpu().numpy(), np.zeros((num_rollouts, 0, 2), dtype=np.float32)
+
+    if spec["type"] == "chunk_cvae":
+        t = window_size
+        stride = int(spec.get("rollout_stride", model.future_horizon))
+        stride = max(1, min(stride, model.future_horizon))
+        while t < max_steps:
+            window = actions[:, t - window_size : t, :]
+            pred = model.predict(window, deterministic=False)
+            take = min(stride, max_steps - t)
+            actions[:, t : t + take, :] = pred[:, :take]
+            t += take
+        return actions.cpu().numpy(), np.zeros((num_rollouts, 0, model.latent_dim), dtype=np.float32)
 
     if spec["type"] == "flow":
         t = window_size
@@ -378,6 +413,39 @@ def collect_chunk_vae_latents(model, trajectories, threshold):
 
 
 @torch.no_grad()
+def collect_chunk_cvae_latents(model, trajectories, threshold):
+    device = next(model.parameters()).device
+    records = []
+    for row in trajectories:
+        actions = row["actions"]
+        chunks = non_overlapping_chunks(actions, model.future_horizon)
+        for chunk_idx, target in enumerate(chunks):
+            end_t = chunk_idx * model.future_horizon
+            hist_end = min(end_t, len(actions) - 1)
+            hist_start = hist_end - model.window_size + 1
+            if hist_start < 0:
+                pad = np.repeat(actions[:1], -hist_start, axis=0)
+                history = np.concatenate([pad, actions[: hist_end + 1]], axis=0)
+            else:
+                history = actions[hist_start : hist_end + 1]
+            history_t = torch.from_numpy(history).unsqueeze(0).to(device)
+            target_t = torch.from_numpy(target).unsqueeze(0).to(device)
+            enc = model.posterior(history_t, target_t)
+            z = enc["post_mu"][0].cpu().numpy()
+            end_f = float(finger_mean(target)[-1])
+            records.append(
+                {
+                    "traj_id": row["traj_id"],
+                    "chunk_idx": chunk_idx + 1,
+                    "z": z,
+                    "end_finger": end_f,
+                    "is_closed": bool(end_f >= threshold),
+                }
+            )
+    return records
+
+
+@torch.no_grad()
 def collect_state_space_latents(model, trajectories, threshold):
     device = next(model.parameters()).device
     records = []
@@ -446,6 +514,58 @@ def plot_joint_rollouts(path, lang, model_label, traj_row, gt_seq, pred_seq, see
             lang,
             f"{model_label} | 轨迹 {traj_row['traj_id']} | onset={traj_row['onset']} | 50 次 AR 采样",
             f"{model_label} | traj {traj_row['traj_id']} | onset={traj_row['onset']} | 50 AR samples",
+        ),
+        fontsize=14,
+    )
+    fig.savefig(path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_joint_bundle(path, lang, model_label, traj_rows, pred_seq, seed_len, max_steps):
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12), constrained_layout=True)
+    joint_names = [text(lang, f"关节 {i+1}", f"Joint {i+1}") for i in range(6)]
+    x = np.arange(max_steps)
+    gt_colors = ["#111827", "#1d4ed8", "#059669", "#b45309", "#b91c1c"]
+
+    gt_vals = [row["actions"][:max_steps] for row in traj_rows]
+    all_gt = np.concatenate(gt_vals, axis=0) if gt_vals else np.zeros((0, 6), dtype=np.float32)
+    all_values = np.concatenate([all_gt, pred_seq.reshape(-1, pred_seq.shape[-1])], axis=0)
+    y_min = float(all_values.min()) - 0.03
+    y_max = float(all_values.max()) + 0.03
+
+    for joint_idx, ax in enumerate(axes.flat):
+        ax.axvspan(0, seed_len - 1, color="#f3e5ab", alpha=0.35, label=text(lang, "初始 chunk", "initial chunk"))
+        for sample_idx in range(pred_seq.shape[0]):
+            label = text(lang, "50 次 AR 采样", "50 AR samples") if joint_idx == 0 and sample_idx == 0 else None
+            ax.plot(x, pred_seq[sample_idx, :, joint_idx], color="#4c78a8", alpha=0.12, linewidth=1.0, label=label)
+        for gt_idx, row in enumerate(traj_rows):
+            seq = row["actions"][:max_steps]
+            gt_x = np.arange(seq.shape[0])
+            label = text(lang, f"GT 轨迹 {row['traj_id']}", f"GT traj {row['traj_id']}")
+            ax.plot(
+                gt_x,
+                seq[:, joint_idx],
+                color=gt_colors[gt_idx % len(gt_colors)],
+                linewidth=2.2,
+                alpha=0.95,
+                label=label if joint_idx == 0 else None,
+            )
+        ax.set_title(joint_names[joint_idx])
+        ax.set_xlabel(text(lang, "步数", "step"))
+        ax.set_ylabel(text(lang, "关节角", "joint angle"))
+        ax.set_xlim(0, max_steps - 1)
+        ax.set_ylim(y_min, y_max)
+        ax.grid(alpha=0.16)
+
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4)
+    picked = " / ".join(str(row["traj_id"]) for row in traj_rows)
+    onsets = " / ".join(str(row["onset"]) for row in traj_rows)
+    fig.suptitle(
+        text(
+            lang,
+            f"{model_label} | 同图 5 条 GT + 50 次 AR（traj={picked}，onset={onsets}）",
+            f"{model_label} | 5 GT + 50 AR in one figure (traj={picked}, onset={onsets})",
         ),
         fontsize=14,
     )
@@ -531,6 +651,26 @@ def main():
         model_dir = out_dir / spec["key"]
         model_dir.mkdir(parents=True, exist_ok=True)
 
+        reset_seed = build_open_mean_seed(all_rows, model.window_size)
+        torch.manual_seed(args.seed + model_idx * 1000 + 777)
+        reset_pred_seq, _ = rollout_from_seed(
+            spec,
+            model,
+            seed_window=reset_seed,
+            num_rollouts=args.num_rollouts,
+            max_steps=args.max_steps,
+        )
+        bundle_file = model_dir / f"gt{args.num_traj}_ar{args.num_rollouts}_same_plot_max{args.max_steps}.png"
+        plot_joint_bundle(
+            bundle_file,
+            args.lang,
+            spec["label"],
+            picked_rows,
+            reset_pred_seq,
+            seed_len=model.window_size,
+            max_steps=args.max_steps,
+        )
+
         for traj_row in picked_rows:
             seed_window = build_seed_window(traj_row["actions"], model.window_size)
             gt_seq = padded_gt(traj_row["actions"], args.max_steps)
@@ -557,6 +697,8 @@ def main():
             latent_records = collect_step_vae_latents(model, all_rows, args.closed_threshold)
         elif spec["type"] == "chunk_vae":
             latent_records = collect_chunk_vae_latents(model, all_rows, args.closed_threshold)
+        elif spec["type"] == "chunk_cvae":
+            latent_records = collect_chunk_cvae_latents(model, all_rows, args.closed_threshold)
         elif spec["type"] == "flow":
             latent_records = collect_flow_latents(model, all_rows, args.closed_threshold)
         else:
@@ -576,6 +718,7 @@ def main():
                 "type": spec["type"],
                 "checkpoint": spec["ckpt"],
                 "output_dir": str(model_dir),
+                "bundle_curve_file": str(bundle_file),
                 "curve_files": [
                     str(model_dir / f"traj_{traj_row['traj_id']}_ar50_max{args.max_steps}.png")
                     for traj_row in picked_rows

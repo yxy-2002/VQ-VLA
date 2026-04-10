@@ -41,11 +41,13 @@ def _load(path, name):
 
 _eval_old = _load("scripts/eval.py", "eval_old")
 _eval_chunk = _load("scripts/eval_chunk.py", "eval_chunk")
+_eval_chunk_cvae = _load("scripts/eval_chunk_cvae.py", "eval_chunk_cvae")
 _eval_flow = _load("scripts/eval_chunk_flow.py", "eval_chunk_flow")
 _eval_ss = _load("scripts/eval_state_space_chunk_prior.py", "eval_state_space_chunk_prior")
 
 HandActionVAE = _eval_old.HandActionVAE
 HandActionChunkVAE = _eval_chunk.HandActionChunkVAE
+HandActionChunkCVAE = _eval_chunk_cvae.HandActionChunkCVAE
 HandActionChunkFlow = _eval_flow.HandActionChunkFlow
 HandActionStateSpaceChunkPrior = _eval_ss.HandActionStateSpaceChunkPrior
 
@@ -256,6 +258,19 @@ def load_model(spec, device):
         model = HandActionVAE(**_eval_old.infer_model_args(ckpt["model"])).to(device)
     elif spec["type"] == "chunk_vae":
         model = HandActionChunkVAE(**_eval_chunk.infer_model_args(ckpt["model"])).to(device)
+    elif spec["type"] == "chunk_cvae":
+        args = ckpt.get("args", {})
+        model = HandActionChunkCVAE(
+            action_dim=args.get("action_dim", 6),
+            window_size=args.get("window_size", 8),
+            future_horizon=args.get("future_horizon", 12),
+            hidden_dim=args.get("hidden_dim", 256),
+            latent_dim=args.get("latent_dim", 2),
+            beta=args.get("beta", 0.001),
+            encoder_type=args.get("encoder_type", "mlp"),
+            num_hidden_layers=args.get("num_hidden_layers", 1),
+            free_bits=args.get("free_bits", 0.0),
+        ).to(device)
     elif spec["type"] == "flow":
         model = HandActionChunkFlow(**_eval_flow.infer_model_args(ckpt)).to(device)
     elif spec["type"] == "state_space":
@@ -286,10 +301,24 @@ def rollout_future_batch(spec, model, seed_window, num_rollouts, future_steps):
 
     if spec["type"] == "chunk_vae":
         t = model.window_size
+        stride = int(spec.get("rollout_stride", model.future_horizon))
+        stride = max(1, min(stride, model.future_horizon))
         while t < total_steps:
             window = actions[:, t - model.window_size : t, :]
             pred = model.predict(window, deterministic=False)
-            take = min(model.future_horizon, total_steps - t)
+            take = min(stride, total_steps - t)
+            actions[:, t : t + take, :] = pred[:, :take]
+            t += take
+        return actions[:, model.window_size :, :].cpu().numpy()
+
+    if spec["type"] == "chunk_cvae":
+        t = model.window_size
+        stride = int(spec.get("rollout_stride", model.future_horizon))
+        stride = max(1, min(stride, model.future_horizon))
+        while t < total_steps:
+            window = actions[:, t - model.window_size : t, :]
+            pred = model.predict(window, deterministic=False)
+            take = min(stride, total_steps - t)
             actions[:, t : t + take, :] = pred[:, :take]
             t += take
         return actions[:, model.window_size :, :].cpu().numpy()
