@@ -22,11 +22,23 @@ VLA models.
 
 ## :clipboard: Contents
 - [Installation](#hammer-installation)
+- [Hand Prior Notes](#memo-hand-prior-notes)
 - [Fine-Tuning VQ-VLA via LoRA](#fire-fine-tuning-vq-vla-via-lora)
 - [VQ-VLA Evaluation (LIBERO)](#rocket-vq-vla-evaluation-libero)
 - [Acknowledgements](#sparkles-acknowledgements)
 - [License](#books-license)
 - [Citation](#pencil-citation)
+
+## :memo: Hand Prior Notes
+
+This repo currently also contains an ongoing hand-state prior research branch under `vae/`.
+
+- The active design notes, project intent, and evaluation guardrails are documented in `vae/README.md`.
+- If you are starting a new discussion about the hand prior work, read `vae/README.md` first.
+- In particular, that document records:
+  - the goal of learning a **general hand state prior** rather than overfitting the current open-to-close toy demo,
+  - the separation between **hand prior** and **visual/TCP guidance**,
+  - and the evaluation preference for **open-like conditional future distributions** over task-specific anti-spike fixes.
 
 ## :hammer: Installation
 1. Setting up VQ-VLA Training Environment
