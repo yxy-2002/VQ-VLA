@@ -150,6 +150,8 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+success/
+*.zip
 
 # Rollout videos and wandb logs
 rollouts/
