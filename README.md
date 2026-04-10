@@ -1,137 +1,46 @@
+# Hand State Prior Workspace
 
-# VQ-VLA: Improving Vision-Language-Action Models via Scaling Vector-Quantized Action Tokenizers
-<div align="center">
+这个仓库当前主要用于手部状态先验相关实验，顶层旧的 VQ-VLA 项目说明已经移除，因为它和当前开发主线不一致。
 
-[![arXiv](https://img.shields.io/badge/arXiv-2507.01016-df2a2a)](https://arxiv.org/abs/2507.01016)
-[![Project](https://img.shields.io/badge/Project-Page-orange)](https://xiaoxiao0406.github.io/vqvla.github.io/)
-[![HF Models](https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow)](https://huggingface.co/VQ-VLA)
-[![PyTorch](https://img.shields.io/badge/-PyTorch_2.2.0-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/get-started/locally/)
-[![Python](https://img.shields.io/badge/-Python_3.10-blue?logo=python&logoColor=white)](https://www.python.org)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+## 当前重点
 
-**ICCV 2025**
+- `vae/`：手部状态先验模型的主要代码与说明
+- `vae/README.md`：最重要的入口文档，记录：
+  - 当前开发需求
+  - 先验模型与视觉 / TCP 引导的职责划分
+  - 指标设计注意事项
+  - 当前保留的主线模型家族
 
-[Yating Wang](https://scholar.google.com/citations?hl=zh-CN&user=5SuBWh0AAAAJ), [Haoyi Zhu](https://www.haoyizhu.site/), [Mingyu Liu](https://mingyulau.github.io/), [Jiange Yang](https://yangjiangeyjg.github.io/),  [Hao-Shu Fang](https://fang-haoshu.github.io/), [Tong He](http://tonghe90.github.io/)
-<!-- <hr style="border: 2px solid gray;"></hr> -->
-</div>
+如果下一次开启新对话，建议先读：
 
-![teaser](assets/vqvla_pipeline.png)
-
-**VQ-VLA** is an innovative vector quantization based action tokenizer built upon the largest-scale action trajectory dataset to date, leveraging over 100 times more data than previous approaches. It demonstrates that action tokenizers can be effectively scaled by leveraging large-scale simulated action data. We prove that our action tokenizers improve the performance, inference speed, and long-horizon capabilities of
-VLA models.
-
-## :clipboard: Contents
-- [Installation](#hammer-installation)
-- [Hand Prior Notes](#memo-hand-prior-notes)
-- [Fine-Tuning VQ-VLA via LoRA](#fire-fine-tuning-vq-vla-via-lora)
-- [VQ-VLA Evaluation (LIBERO)](#rocket-vq-vla-evaluation-libero)
-- [Acknowledgements](#sparkles-acknowledgements)
-- [License](#books-license)
-- [Citation](#pencil-citation)
-
-## :memo: Hand Prior Notes
-
-This repo currently also contains an ongoing hand-state prior research branch under `vae/`.
-
-- The active design notes, project intent, and evaluation guardrails are documented in `vae/README.md`.
-- If you are starting a new discussion about the hand prior work, read `vae/README.md` first.
-- In particular, that document records:
-  - the goal of learning a **general hand state prior** rather than overfitting the current open-to-close toy demo,
-  - the separation between **hand prior** and **visual/TCP guidance**,
-  - and the evaluation preference for **open-like conditional future distributions** over task-specific anti-spike fixes.
-
-## :hammer: Installation
-1. Setting up VQ-VLA Training Environment
-```bash
-# create conda environment
-conda create -n vqvla python=3.10 -y
-conda activate vqvla
-
-# install PyTorch (adjust for your CUDA version)
-pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
-
-# clone project and install the vqvla repo
-git clone https://github.com/xiaoxiao0406/VQ-VLA.git
-cd vqvla
-pip install -e .
-
-# install Flash Attention 2 for training (https://github.com/Dao-AILab/flash-attention)
-pip install packaging ninja
-ninja --version; echo $?  # Verify Ninja --> should return exit code "0"
-pip install "flash-attn==2.5.5" --no-build-isolation
-```
-2. Setting up VQ-VLA Evaluation Environment (LIBERO)
-```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-cd LIBERO
-pip install -e .
-
-cd vqvla
-pip install -r experiments/robot/libero/libero_requirements.txt
+```text
+vae/README.md
 ```
 
-## :fire: Fine-Tuning VQ-VLA via LoRA
-### Step 0: Download Dataset (Optional)
-Download the Libero-90 RLDS dataset using the following command:
-```
-huggingface-cli download --resume-download --repo-type dataset VQ-VLA/libero_90_rlds --local-dir <YOUR_DATA_DIRECTORY>
-```
-Replace <YOUR_DATA_DIRECTORY> with your desired data storage path
-**Note:** If you want to train with your own dataset, you can convert your data to RLDS format by following the code at: [rlds_dataset_builder](https://github.com/moojink/rlds_dataset_builder)
-### Step 1: Training VQ
-```
-bash scripts/train_action_vqvae.sh <TRAIN_DATASET_NAME> <WANDB_NAME> <YOUR_DATA_DIRECTORY>
+## 当前项目目标
 
-# For example：
-bash scripts/train_action_vqvae.sh libero_90_no_noops train_vq_libero_90 <YOUR_DATA_DIRECTORY>
-```
+当前想做的是一个**通用的手部状态先验模型**：
 
-### Step 2: Finetune VQ-VLA 
-We use LoRA (Low-Rank Adaptation) to fine-tune the VLA model with a total batch size of 16:
-```
-torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune_vqvla.py \
-  --vla_path openvla/openvla \  
-  --data_root_dir <YOUR_DATA_DIRECTORY> \
-  --dataset_name <DATASET_NAME> \
-  --run_root_dir <PATH_TO_LOG/CHECKPOINT_DIRECTORY> \
-  --lora_rank 32 \
-  --batch_size 16 \
-  --grad_accumulation_steps 1 \
-  --learning_rate 5e-4 \
-  --image_aug True \
-  --max_steps 400000 \
-  --checkpoint_path <VQ_CHECKPOINT_DIRECTORY>
-```
-We have fine-tuned OpenVLA on Libero-90 dataset. The model weights are available on Hugging Face: [VQ-VLA/openvla-7b-finetuned-libero-90](https://huggingface.co/VQ-VLA/openvla-7b-finetuned-libero-90)
+- 输入过去一段时间的手部 `state chunk`
+- 预测下一时刻或下一段 future 的**状态分布**
+- 当前 `state` / `action` 都表示手各关节的 joint angle
 
-## :rocket: VQ-VLA Evaluation (LIBERO)
+后续视觉 policy 的角色不是直接回归整只手的高维动作，而是：
 
-We train an action tokenizer (using the largest version of the datasets) using data from datasets: [Open X-Embodiment](https://github.com/google-deepmind/open_x_embodiment), [RH20T](https://rh20t.github.io/), [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO), [ManiSkill](https://github.com/haosulab/ManiSkill), [RLBench](https://github.com/stepjam/RLBench). The trained action tokenizer weights and VQ-VLA model fine-tuned on LIBERO-90 are available on [Hugging Face](https://huggingface.co/VQ-VLA/vq-vla-weight).
-```bash
-huggingface-cli download --resume-download VQ-VLA/vq-vla-weight --local-dir <YOUR_WEIGHT_DIRECTORY>
+- 输出对低维 latent 分布的 guidance / bias
+- 在手部先验给出的合理分布内进行引导采样
 
-# LIBERO-90 eval
-python experiments/robot/libero/run_libero_eval_vq_vla.py 
-  --pretrained_checkpoint "<YOUR_WEIGHT_DIRECTORY>/vq-vla-weight/vqvla_weight" \
-  --task_suite_name "libero_90" \
-  --vqvae_ckpt "<YOUR_WEIGHT_DIRECTORY>/vq-vla-weight/action_tokenizer_weight/all_data_vq.pth"
-```
+## 设计原则
 
-## :sparkles: Acknowledgements
-Our work is primarily built upon [OpenVLA](https://github.com/openvla/openvla), [Pyramid Flow](https://github.com/jy0205/Pyramid-Flow), [VQ-BeT](https://github.com/jayLEE0301/vq_bet_official), [vector-quantize-pytorch](https://github.com/lucidrains/vector-quantize-pytorch), [Open X-Embodiment](https://github.com/google-deepmind/open_x_embodiment), [RH20T](https://rh20t.github.io/), [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO), [ManiSkill](https://github.com/haosulab/ManiSkill), [RLBench](https://github.com/stepjam/RLBench).
+- 不要把当前“张开手 -> 合拢手”的 demo 过拟合成方法本身
+- 不要引入 task-specific 的“精准动刀” loss 作为主线
+- 评估重点应放在：
+  - open-like 条件未来分布
+  - 延迟分布 / hazard
+  - reopen 违例率
+  - 闭合尾段幅度校准
 
-## :books: License
-This repository is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. For any questions, please email to tonghe90[at]gmail[dot]com.
+## 说明
 
-## :pencil: Citation
-
-If you find our code or models useful in your work, please cite [our paper](https://arxiv.org/abs/2507.01016):
-
-```bibtex
-@inproceedings{wang25vqvla,
-      title={VQ-VLA: Improving Vision-Language-Action Models via Scaling Vector-Quantized Action Tokenizers},
-      author={Yating Wang, Haoyi Zhu, Mingyu Liu, Jiange Yang, Hao-Shu Fang, Tong He},
-      booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision},
-      year={2025}
-}
-```
+- 仓库里仍可能保留一些历史文件和旧脚本，但它们不代表当前主线。
+- 当前主线开发请以 `vae/README.md` 和 `vae/scripts/` 下的新评估 / 可视化脚本为准。
