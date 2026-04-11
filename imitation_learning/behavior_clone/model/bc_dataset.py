@@ -1,22 +1,43 @@
 """
 Dataset for Behavior Cloning over a frozen Hand-Action VAE.
 
-Each sample at trajectory frame t yields:
+NAMING CONVENTION (CRITICAL):
+  In this dataset the field `actions` represents the robot's ABSOLUTE POSE at
+  each timestep (12 dims = 6 arm + 6 hand). So `actions[t]` IS the robot
+  state at time t. The BC policy predicts the NEXT pose `actions[t+1]`.
+
+  ─────────────────────────────────────────────────────────
+   time t            : observe state[t] = actions[t]
+   BC predicts       : actions[t+1]   (the next absolute pose)
+  ─────────────────────────────────────────────────────────
+
+This matches the frozen VAE's training convention exactly: the VAE was
+trained to predict `a_{t+1}` from window `[a_{t-7}..a_t]`, so we feed it
+the same window and use its output as a prior over the next hand pose.
+
+Each sample at trajectory frame t (0 <= t < T) yields:
+
   img_main      : (3, 128, 128)  float32 in [0, 1]
   img_extra     : (3, 128, 128)  float32 in [0, 1]
-  state         : (24,)          float32, standardized by train mean/std
-  past_hand_win : (8, 6)         float32, hand actions [a_{t-8} .. a_{t-1}]
-                  left-padded with actions[0] when t < 8.
-  gt_action     : (12,)          float32, raw action at frame t
+  state         : (12,)          float32, = actions[t] standardized by
+                                  per-dim mean/std (z-score), then optionally
+                                  masked for ablations. BC 3.0 only consumes
+                                  the first 6 arm dims; the hand dims are kept
+                                  for backward-compatibility with older logs.
+  past_hand_win : (8, 6)         float32, hand actions [a_{t-7}..a_t]
+                                  inclusive of current frame, padded with
+                                  hand[0] when t < 7. Matches the VAE's
+                                  HandActionWindowDataset window EXACTLY.
+  gt_action     : (12,)          float32, target = actions[t+1] (raw, NOT
+                                  normalized — the VAE decoder is trained
+                                  in raw action space). For t == T-1 we use
+                                  actions[T-1] (hold last pose).
 
-CRITICAL: past_hand_win ENDS AT t-1 (exclusive of t). The frozen VAE was
-trained to predict a_{t+1} from window [a_{t-7} .. a_t], so to use it as a
-prior over a_t we must shift its input one step earlier — otherwise the
-target leaks into the prior. This is the single most important detail in
-the BC dataset.
-
-Images are kept in RAM as uint8 (~500 MB total) and cast to float32 only
-inside __getitem__ to avoid 4 GB RAM blowup.
+IMPORTANT — past_hand_win is NOT a BC trainable input:
+  The BC network's trainable layers only see (img_main, img_extra, state).
+  past_hand_win is consumed exclusively by the FROZEN VAE encoder to compute
+  a prior (mu_p, log_var_p) over the next hand pose. The BC's job is to predict
+  a small delta_z correction so that z_ctrl = mu_prior + delta_z.
 """
 
 from pathlib import Path
@@ -25,12 +46,12 @@ import torch
 from torch.utils.data import Dataset
 
 
-def compute_state_stats(data_dir: str):
-    """One pass over the train split: per-dim mean/std of curr_obs.states.
+def compute_action_stats(data_dir: str):
+    """One pass over the train split: per-dim mean/std of 12-dim action vectors.
 
     Returns:
-        mean: (24,) float32
-        std:  (24,) float32  (clamped to >= 1e-6 to avoid divide-by-zero)
+        mean: (12,) float32
+        std:  (12,) float32  (clamped to >= 1e-6 to avoid divide-by-zero)
     """
     data_dir = Path(data_dir)
     files = sorted(data_dir.glob("trajectory_*_demo_expert.pt"))
@@ -40,42 +61,68 @@ def compute_state_stats(data_dir: str):
     chunks = []
     for f in files:
         data = torch.load(f, map_location="cpu", weights_only=False)
-        chunks.append(data["curr_obs"]["states"][:, 0, :].float())  # (T, 24)
-    all_states = torch.cat(chunks, dim=0)  # (sum_T, 24)
-    mean = all_states.mean(dim=0)
-    std = all_states.std(dim=0).clamp(min=1e-6)
+        chunks.append(data["actions"][:, 0, :].float())  # (T, 12)
+    all_actions = torch.cat(chunks, dim=0)
+    mean = all_actions.mean(dim=0)
+    std = all_actions.std(dim=0).clamp(min=1e-6)
     return mean, std
 
 
+def apply_state_mask(state: torch.Tensor, state_mask: str) -> torch.Tensor:
+    """Apply a fixed ablation mask to a standardized 12-dim action state."""
+    if state_mask == "all":
+        return state
+    masked = state.clone()
+    if state_mask == "arm_only":
+        masked[..., 6:12] = 0.0
+        return masked
+    if state_mask == "none":
+        masked.zero_()
+        return masked
+    raise ValueError(f"Unsupported state_mask={state_mask!r}")
+
+
 class BCDataset(Dataset):
-    """Behavior cloning dataset: images + state + past hand window + GT action.
+    """BC dataset: per-step observation + next-action target.
 
     Args:
         data_dir:    directory with trajectory_*_demo_expert.pt files
-        state_mean:  (24,) tensor — per-dim mean for state standardization
-        state_std:   (24,) tensor — per-dim std (already clamped)
+        action_mean: (12,) per-dim mean for state standardization
+        action_std:  (12,) per-dim std (already clamped)
         window_size: VAE prior window size (must match VAE training; default 8)
     """
 
     def __init__(
         self,
         data_dir: str,
-        state_mean: torch.Tensor,
-        state_std: torch.Tensor,
+        action_mean: torch.Tensor,
+        action_std: torch.Tensor,
         window_size: int = 8,
+        noise_std_hand: float = 0.0,
+        state_mask: str = "all",
     ):
+        """
+        Args:
+            ...
+            noise_std_hand: if > 0, add Gaussian noise (std=this) to past_hand_win
+                            in __getitem__. Set 0 for test split. Trains the BC
+                            to be robust to small perturbations in the hand
+                            history input — partial mitigation of AR drift.
+            state_mask: fixed ablation over the standardized 12-dim state input.
+        """
         data_dir = Path(data_dir)
         traj_files = sorted(data_dir.glob("trajectory_*_demo_expert.pt"))
         if not traj_files:
             raise FileNotFoundError(f"No trajectory files in {data_dir}")
 
         self.window_size = window_size
-        self.state_mean = state_mean.clone().float()
-        self.state_std = state_std.clone().float()
+        self.action_mean = action_mean.clone().float()
+        self.action_std = action_std.clone().float()
+        self.noise_std_hand = float(noise_std_hand)
+        self.state_mask = str(state_mask)
 
-        # Per-trajectory tensors (pre-loaded into RAM)
+        # Per-trajectory tensors (preloaded into RAM)
         self.actions = []     # list of (T, 12) float32
-        self.states = []      # list of (T, 24) float32
         self.imgs_main = []   # list of (T, 3, 128, 128) uint8
         self.imgs_extra = []  # list of (T, 3, 128, 128) uint8
 
@@ -85,22 +132,16 @@ class BCDataset(Dataset):
         for traj_idx, f in enumerate(traj_files):
             data = torch.load(f, map_location="cpu", weights_only=False)
 
-            actions = data["actions"][:, 0, :].float()                  # (T, 12)
-            states = data["curr_obs"]["states"][:, 0, :].float()        # (T, 24)
-            # main_images:  (T, 1, H, W, 3) -> (T, 3, H, W) uint8
-            main = data["curr_obs"]["main_images"][:, 0]                # (T, H, W, 3) uint8
-            main = main.permute(0, 3, 1, 2).contiguous()                # (T, 3, H, W)
-            # extra_view_images: (T, 1, 1, H, W, 3) -> (T, 3, H, W) uint8
-            extra = data["curr_obs"]["extra_view_images"][:, 0, 0]      # (T, H, W, 3) uint8
-            extra = extra.permute(0, 3, 1, 2).contiguous()              # (T, 3, H, W)
+            actions = data["actions"][:, 0, :].float()                # (T, 12)
+            main = data["curr_obs"]["main_images"][:, 0]              # (T, H, W, 3) uint8
+            main = main.permute(0, 3, 1, 2).contiguous()              # (T, 3, H, W)
+            extra = data["curr_obs"]["extra_view_images"][:, 0, 0]    # (T, H, W, 3) uint8
+            extra = extra.permute(0, 3, 1, 2).contiguous()            # (T, 3, H, W)
 
-            T = actions.shape[0]
             self.actions.append(actions)
-            self.states.append(states)
             self.imgs_main.append(main)
             self.imgs_extra.append(extra)
-
-            for t in range(T):
+            for t in range(actions.shape[0]):
                 self.samples.append((traj_idx, t))
 
         n_frames = len(self.samples)
@@ -117,31 +158,43 @@ class BCDataset(Dataset):
         traj_idx, t = self.samples[idx]
 
         actions = self.actions[traj_idx]      # (T, 12)
-        states = self.states[traj_idx]        # (T, 24)
         main = self.imgs_main[traj_idx]       # (T, 3, H, W) uint8
         extra = self.imgs_extra[traj_idx]     # (T, 3, H, W) uint8
+        T = actions.shape[0]
 
-        # --- Past hand window ENDING AT t-1 (NOT t). See module docstring. ---
-        hand = actions[:, 6:12]               # (T, 6)
-        start = t - self.window_size          # may be negative
+        # ── BC trainable inputs at time t ──
+        img_main = main[t].float() / 255.0    # (3, H, W)
+        img_extra = extra[t].float() / 255.0  # (3, H, W)
+        # state = actions[t] (current absolute pose), z-score normalized and
+        # optionally ablated to test whether timing is leaking through state.
+        state = (actions[t] - self.action_mean) / self.action_std  # (12,)
+        state = apply_state_mask(state, self.state_mask)
+
+        # ── Frozen VAE input (NOT a BC trainable input) ──
+        # past_hand_win = 8 frames [a_{t-7}..a_t] inclusive of current frame.
+        # Padded with hand[0] when t < window_size - 1. Matches VAE training.
+        hand = actions[:, 6:12]
+        start = t - self.window_size + 1      # = t - 7
         if start < 0:
             pad_len = -start
             past_hand_win = torch.cat(
-                [hand[0:1].expand(pad_len, -1), hand[0:t]],
+                [hand[0:1].expand(pad_len, -1), hand[0:t + 1]],
                 dim=0,
             )
         else:
-            past_hand_win = hand[start:t]
-        # If t == 0, hand[0:0] is empty -> all 8 slots come from the pad branch.
+            past_hand_win = hand[start:t + 1]
         assert past_hand_win.shape == (self.window_size, 6), (
             f"past_hand_win shape {past_hand_win.shape} at traj={traj_idx} t={t}"
         )
+        # Optional Gaussian noise on past_hand_win (training only — set 0 for test)
+        if self.noise_std_hand > 0:
+            past_hand_win = past_hand_win + torch.randn_like(past_hand_win) * self.noise_std_hand
 
-        # --- Observations at frame t ---
-        img_main = main[t].float() / 255.0    # (3, H, W) in [0, 1]
-        img_extra = extra[t].float() / 255.0  # (3, H, W) in [0, 1]
-        state = (states[t] - self.state_mean) / self.state_std  # (24,)
-        gt_action = actions[t]                # (12,) raw
+        # ── Target: actions[t+1] (or actions[t] for last frame, hold) ──
+        if t + 1 < T:
+            gt_action = actions[t + 1]
+        else:
+            gt_action = actions[t]
 
         return {
             "img_main": img_main,

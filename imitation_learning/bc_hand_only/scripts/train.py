@@ -1,24 +1,20 @@
 """
-Train Behavior Cloning policy over a frozen Hand Action VAE.
+Train hand-only Behavior Cloning policy over a frozen Hand Action VAE.
 
-Predicts:
-  - arm_action  (dims 0-5): decode from {visual_feat, arm_state_feat}
-  - hand_action (dims 6-11): VAE.decode(mu_prior + delta_z) — decoder frozen
-    where delta_z is predicted from {visual_feat, hand_prior_feat} and can
-    optionally also condition on arm_state_feat
+Predicts delta_z correction so that z_ctrl = mu_prior + delta_z, then
+hand_action = VAE.decode(z_ctrl). No arm branch — purely hand diagnostics.
 
 Usage:
-    python imitation_learning/behavior_clone/scripts/train.py \
+    python imitation_learning/bc_hand_only/scripts/train.py \
         --train_dir data/20260327-11:10:43/demos/success/train \
         --test_dir  data/20260327-11:10:43/demos/success/test \
         --vae_ckpt  outputs/dim_2_best/checkpoint.pth \
-        --output_dir outputs/bc_simple_v1
+        --output_dir outputs/bc_hand_only_sweep/baseline
 """
 
 import argparse
 import importlib.util
 import os
-import sys
 import time
 
 import torch
@@ -26,8 +22,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_BC_ROOT = os.path.dirname(_SCRIPT_DIR)
-_PROJ_ROOT = os.path.abspath(os.path.join(_BC_ROOT, "..", ".."))
+_BC_HAND_ROOT = os.path.dirname(_SCRIPT_DIR)
+_PROJ_ROOT = os.path.abspath(os.path.join(_BC_HAND_ROOT, "..", ".."))
 _VAE_ROOT = os.path.join(_PROJ_ROOT, "vae")
 
 
@@ -38,13 +34,12 @@ def _load(path: str, name: str):
     return mod
 
 
-_dataset_mod = _load(os.path.join(_BC_ROOT, "model/bc_dataset.py"), "bc_dataset")
-_policy_mod = _load(os.path.join(_BC_ROOT, "model/bc_policy.py"), "bc_policy")
+_dataset_mod = _load(os.path.join(_BC_HAND_ROOT, "model/bc_hand_dataset.py"), "bc_hand_dataset")
+_policy_mod = _load(os.path.join(_BC_HAND_ROOT, "model/bc_hand_policy.py"), "bc_hand_policy")
 _utils_mod = _load(os.path.join(_VAE_ROOT, "model/utils.py"), "vae_utils")
 
-BCDataset = _dataset_mod.BCDataset
-compute_action_stats = _dataset_mod.compute_action_stats
-BCPolicy = _policy_mod.BCPolicy
+BCHandDataset = _dataset_mod.BCHandDataset
+BCHandPolicy = _policy_mod.BCHandPolicy
 build_and_freeze_vae = _policy_mod.build_and_freeze_vae
 trainable_params = _policy_mod.trainable_params
 strip_vae_state_dict = _policy_mod.strip_vae_state_dict
@@ -55,13 +50,13 @@ cosine_scheduler = _utils_mod.cosine_scheduler
 
 
 def get_args():
-    p = argparse.ArgumentParser(description="Train BC policy with frozen VAE")
+    p = argparse.ArgumentParser(description="Train hand-only BC policy with frozen VAE")
     # Data
     p.add_argument("--train_dir", type=str, required=True)
     p.add_argument("--test_dir", type=str, required=True)
     p.add_argument("--vae_ckpt", type=str,
                    default="outputs/dim_2_best/checkpoint.pth")
-    p.add_argument("--output_dir", type=str, default="outputs/bc_simple_v2")
+    p.add_argument("--output_dir", type=str, default="outputs/bc_hand_only")
     p.add_argument("--window_size", type=int, default=8,
                    help="VAE prior window size — must match VAE training")
     # Model
@@ -69,50 +64,27 @@ def get_args():
                    help="Per-branch feature width before fusion")
     p.add_argument("--fusion_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0,
-                   help="Dropout probability in the arm/head MLPs. "
-                        "0 = off. Helps reduce overfitting on the small BC dataset.")
-    p.add_argument("--hand_condition_on_arm", action="store_true",
-                   help="If set, the hand branch also receives the encoded arm-state latent. "
-                        "If unset, the hand branch sees only vision + VAE prior latent.")
+                   help="Dropout probability in the hand delta-z head")
     # Training
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=5e-4,
-                   help="Lower than VAE's 2e-3 — from-scratch CNN can spike at higher LR")
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--min_lr", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--total_steps", type=int, default=20000)
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--clip_grad", type=float, default=1.0)
     p.add_argument("--noise_std_hand", type=float, default=0.0,
-                   help="Gaussian noise std added to past_hand_win during training "
-                        "only (test split always 0). Trains the BC to be robust to "
-                        "small perturbations in the hand history input — partial "
-                        "mitigation of AR drift. Matches the VAE convention.")
+                   help="Gaussian noise std on past_hand_win during training")
     p.add_argument("--disable_vision", action="store_true",
-                   help="Ablation: zero out CNN features and freeze CNN params. "
-                        "BC sees only state + past_hand_win. Used to check "
-                        "whether the vision input contributes anything beyond "
-                        "the 12-dim absolute pose.")
-    p.add_argument("--state_mask", type=str, default="all",
-                   choices=["all", "arm_only", "none"],
-                   help="Ablation over the standardized 12-dim state input. "
-                        "In BC 3.0 only the first 6 arm dims are consumed, so "
-                        "all and arm_only are equivalent; none zeros the arm state too.")
+                   help="Ablation: zero out CNN features and freeze CNN params")
     p.add_argument("--reg_drift", type=float, default=1.0,
-                   help="Weight on the hand-drift regularizer "
-                        "MSE(hand_action, hand_no_corr). hand_no_corr is the frozen "
-                        "decoder output at mu_prior, so the regularizer penalizes how "
-                        "far the hand branch pushes the latent away from the prior mean.")
-    p.add_argument("--num_workers", type=int, default=0,
-                   help="0 = single process. Default is 0 because all data is "
-                        "preloaded into RAM and forking workers can blow /dev/shm.")
+                   help="Weight on drift regularizer MSE(hand_action, hand_no_corr)")
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     # Logging
     p.add_argument("--print_freq", type=int, default=200)
     p.add_argument("--eval_freq", type=int, default=1000)
     p.add_argument("--save_freq", type=int, default=5000)
-    p.add_argument("--eval_samples", type=int, default=3,
-                   help="Kept for compatibility; current hand path is deterministic")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -122,70 +94,52 @@ def get_args():
 
 
 @torch.no_grad()
-def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device,
-             eval_samples: int = 3) -> dict:
-    """Eval set MSE for arm, hand, and the no-correction baseline (delta_z = 0).
-
-    eval_samples is kept only for CLI/checkpoint compatibility; the current hand
-    path is deterministic, so evaluation uses a single forward pass.
-    """
-    del eval_samples
+def evaluate(policy: BCHandPolicy, loader: DataLoader, device: torch.device) -> dict:
+    """Eval set MSE for hand (with correction) and no-correction baseline."""
     policy.eval()
-
-    sums = {"arm": 0.0, "hand_full": 0.0, "hand_no_corr": 0.0, "n": 0}
+    sums = {"hand_full": 0.0, "hand_no_corr": 0.0, "n": 0}
 
     for batch in loader:
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        gt = batch["gt_action"]
-        arm_gt = gt[:, :6]
-        hand_gt = gt[:, 6:]
+        gt = batch["gt_hand_action"]
 
         out = policy(
             img_main=batch["img_main"],
             img_extra=batch["img_extra"],
-            state=batch["state"],
             past_hand_win=batch["past_hand_win"],
         )
-        arm_mse = F.mse_loss(out["arm_action"], arm_gt).item()
-        hand_mse_full = F.mse_loss(out["hand_action"], hand_gt).item()
+        hand_mse_full = F.mse_loss(out["hand_action"], gt).item()
 
         out_zero = policy(
             img_main=batch["img_main"],
             img_extra=batch["img_extra"],
-            state=batch["state"],
             past_hand_win=batch["past_hand_win"],
             zero_delta=True,
         )
-        hand_mse_no_corr = F.mse_loss(out_zero["hand_action"], hand_gt).item()
+        hand_mse_no_corr = F.mse_loss(out_zero["hand_action"], gt).item()
 
         batch_size = gt.shape[0]
-        sums["arm"] += arm_mse * batch_size
         sums["hand_full"] += hand_mse_full * batch_size
         sums["hand_no_corr"] += hand_mse_no_corr * batch_size
         sums["n"] += batch_size
 
     policy.train()
-
     n = sums["n"]
     return {
-        "arm_mse": sums["arm"] / n,
         "hand_mse_full": sums["hand_full"] / n,
         "hand_mse_no_correction": sums["hand_no_corr"] / n,
-        "total_mse": (sums["arm"] + sums["hand_full"]) / n,
     }
 
 
 # ─── Checkpoint ────────────────────────────────────────────────────────────────
 
 
-def save_checkpoint(policy, optimizer, step, output_dir, action_mean, action_std, args):
+def save_checkpoint(policy, optimizer, step, output_dir, args):
     os.makedirs(output_dir, exist_ok=True)
     state = {
         "model": strip_vae_state_dict(policy.state_dict()),
         "optimizer": optimizer.state_dict(),
         "step": step,
-        "action_mean": action_mean,
-        "action_std": action_std,
         "args": vars(args),
     }
     torch.save(state, os.path.join(output_dir, f"checkpoint-{step}.pth"))
@@ -211,10 +165,10 @@ def save_training_curves(history, output_dir, args):
     window = max(1, min(100, len(steps) // 10))
     kernel = ones(window) / window
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        f"BC Training Curves  (lr={args.lr}, batch={args.batch_size}, "
-        f"steps={args.total_steps})",
+        f"Hand-Only BC Training  (lr={args.lr}, batch={args.batch_size}, "
+        f"steps={args.total_steps}, reg_drift={args.reg_drift})",
         fontsize=13,
     )
 
@@ -227,55 +181,41 @@ def save_training_curves(history, output_dir, args):
     sm = smooth(history["train_total"])
     ax.plot(steps[:len(sm)], sm, color="blue", linewidth=1.5, label="Smoothed")
     ax.set_xlabel("Step"); ax.set_ylabel("Loss")
-    ax.set_title(f"Train Total Loss  (arm + hand + {args.reg_drift}*drift)")
+    ax.set_title(f"Train Total Loss  (hand + {args.reg_drift}*drift)")
     ax.grid(True, alpha=0.3); ax.legend()
 
-    # 2. Train arm vs hand vs drift
+    # 2. Train hand vs drift
     ax = axes[0, 1]
-    sm_arm = smooth(history["train_arm"])
     sm_hand = smooth(history["train_hand"])
     sm_drift = smooth(history["train_drift"])
-    ax.plot(steps[:len(sm_arm)], sm_arm, color="green", linewidth=1.5, label="arm (smoothed)")
     ax.plot(steps[:len(sm_hand)], sm_hand, color="red", linewidth=1.5, label="hand (smoothed)")
     ax.plot(steps[:len(sm_drift)], sm_drift, color="purple", linewidth=1.5,
             label="drift (unweighted)", linestyle="--")
     ax.set_xlabel("Step"); ax.set_ylabel("MSE")
-    ax.set_title("Train arm / hand / drift MSE")
+    ax.set_title("Train hand / drift MSE")
     ax.grid(True, alpha=0.3); ax.legend()
 
-    # 3. Val arm + hand_full + no_correction baseline
-    ax = axes[0, 2]
-    if eval_steps:
-        ax.plot(eval_steps, history["val_arm"], "go-", markersize=4, label="val arm")
-        ax.plot(eval_steps, history["val_hand_full"], "ro-", markersize=4, label="val hand (delta)")
-        ax.plot(eval_steps, history["val_hand_no_corr"], "k--", linewidth=1, label="val hand (no corr)")
-    ax.set_xlabel("Step"); ax.set_ylabel("MSE")
-    ax.set_title("Validation MSE")
-    ax.grid(True, alpha=0.3); ax.legend()
-
-    # 4. Val total
+    # 3. Val hand_full vs hand_no_corr
     ax = axes[1, 0]
     if eval_steps:
-        ax.plot(eval_steps, history["val_total"], "bo-", markersize=4, label="val total")
-    ax.set_xlabel("Step"); ax.set_ylabel("Loss")
-    ax.set_title("Validation Total MSE")
-    ax.grid(True, alpha=0.3); ax.legend()
+        ax.plot(eval_steps, history["val_hand_full"], "ro-", markersize=4,
+                label="val hand (delta)")
+        ax.plot(eval_steps, history["val_hand_no_corr"], "k--", linewidth=1,
+                label="val hand (no corr)")
+        improvement = [b - a for a, b in
+                       zip(history["val_hand_full"], history["val_hand_no_corr"])]
+        ax.plot(eval_steps, improvement, "mo-", markersize=3, alpha=0.6,
+                label="vision gain (no_corr - full)")
+        ax.axhline(0, color="gray", linestyle=":", linewidth=0.8)
+    ax.set_xlabel("Step"); ax.set_ylabel("MSE")
+    ax.set_title("Validation Hand MSE")
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
 
-    # 5. LR schedule
+    # 4. LR schedule
     ax = axes[1, 1]
     ax.plot(steps, history["train_lr"], color="teal", linewidth=1.5)
     ax.set_xlabel("Step"); ax.set_ylabel("Learning Rate")
     ax.set_title("Learning Rate (Cosine)")
-    ax.grid(True, alpha=0.3)
-
-    # 6. Hand-MSE delta vs no-correction (proxy for "did vision help?")
-    ax = axes[1, 2]
-    if eval_steps:
-        improvement = [b - a for a, b in zip(history["val_hand_full"], history["val_hand_no_corr"])]
-        ax.plot(eval_steps, improvement, "mo-", markersize=4)
-        ax.axhline(0, color="gray", linestyle="--", linewidth=1)
-    ax.set_xlabel("Step"); ax.set_ylabel("hand_no_corr - hand_full")
-    ax.set_title("Vision Improvement Over No-Correction Baseline")
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -294,24 +234,16 @@ def main():
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── Action stats from train split (one pass over all 12-dim action vectors) ──
-    print(f"Computing action mean/std from {args.train_dir} ...")
-    action_mean, action_std = compute_action_stats(args.train_dir)
-    print(f"  action_mean = {[round(x, 3) for x in action_mean.tolist()]}")
-    print(f"  action_std  = {[round(x, 3) for x in action_std.tolist()]}")
-
     # ── Datasets ──
-    train_ds = BCDataset(
-        args.train_dir, action_mean=action_mean, action_std=action_std,
+    train_ds = BCHandDataset(
+        args.train_dir,
         window_size=args.window_size,
         noise_std_hand=args.noise_std_hand,
-        state_mask=args.state_mask,
     )
-    test_ds = BCDataset(
-        args.test_dir, action_mean=action_mean, action_std=action_std,
+    test_ds = BCHandDataset(
+        args.test_dir,
         window_size=args.window_size,
-        noise_std_hand=0.0,   # never noise the eval split
-        state_mask=args.state_mask,
+        noise_std_hand=0.0,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -322,38 +254,28 @@ def main():
         num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── Model: frozen VAE wrapped inside BCPolicy ──
+    # ── Model ──
     vae = build_and_freeze_vae(args.vae_ckpt)
-    policy = BCPolicy(
+    policy = BCHandPolicy(
         vae=vae,
-        state_dim=12,   # kept for compatibility; policy uses the first 6 arm dims
-        arm_state_dim=6,
         feat_dim=args.feat_dim,
         fusion_dim=args.fusion_dim,
         disable_vision=args.disable_vision,
         dropout=args.dropout,
-        hand_condition_on_arm=args.hand_condition_on_arm,
     ).to(device)
     if args.disable_vision:
         print("[Ablation] disable_vision=True — CNN outputs forced to 0, "
-              "CNN params frozen, BC sees only state + past_hand_win.")
+              "CNN params frozen. BC sees only past_hand_win via frozen VAE.")
     if args.noise_std_hand > 0:
         print(f"[Aug] noise_std_hand={args.noise_std_hand} — train past_hand_win "
               f"will get N(0, {args.noise_std_hand}) noise per __getitem__.")
-    if args.state_mask != "all":
-        print(f"[Ablation] state_mask={args.state_mask} — standardized state input "
-              "will be masked before entering the BC encoder.")
-    print(
-        "[Arch] BC 3.0 — weakly-coupled arm/hand branches, "
-        f"hand_condition_on_arm={args.hand_condition_on_arm}."
-    )
 
     n_total = sum(p.numel() for p in policy.parameters())
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"Policy parameters: total={n_total:,}  trainable={n_train:,}  "
           f"frozen={n_total - n_train:,}")
 
-    # ── Optimizer & LR schedule (no beta — BC has no KL) ──
+    # ── Optimizer & LR schedule ──
     optimizer = torch.optim.AdamW(
         trainable_params(policy), lr=args.lr, weight_decay=args.weight_decay,
     )
@@ -362,7 +284,6 @@ def main():
     )
 
     # ── Step-0 sanity check ──
-    # Verify zero-init: the hand delta-z head must output exactly 0 on a real batch.
     print("\n[Sanity] Step-0 zero-init check:")
     policy.eval()
     with torch.no_grad():
@@ -371,7 +292,6 @@ def main():
         peek_out = policy(
             img_main=peek_batch["img_main"],
             img_extra=peek_batch["img_extra"],
-            state=peek_batch["state"],
             past_hand_win=peek_batch["past_hand_win"],
         )
     dz_max = peek_out["delta_z"].abs().max().item()
@@ -380,18 +300,16 @@ def main():
     policy.train()
 
     print("[Sanity] Step-0 evaluation:")
-    init_eval = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
-    print(f"  arm_mse                = {init_eval['arm_mse']:.6f}")
+    init_eval = evaluate(policy, test_loader, device)
     print(f"  hand_mse_full          = {init_eval['hand_mse_full']:.6f}")
     print(f"  hand_mse_no_correction = {init_eval['hand_mse_no_correction']:.6f}")
     print()
 
     # ── Training loop ──
     history = {
-        "steps": [], "train_total": [], "train_arm": [], "train_hand": [],
+        "steps": [], "train_total": [], "train_hand": [],
         "train_drift": [], "train_lr": [],
-        "eval_steps": [], "val_arm": [], "val_hand_full": [],
-        "val_hand_no_corr": [], "val_total": [],
+        "eval_steps": [], "val_hand_full": [], "val_hand_no_corr": [],
     }
 
     train_iter = iter(train_loader)
@@ -411,21 +329,16 @@ def main():
             pg["lr"] = lr_schedule[step]
 
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        gt = batch["gt_action"]
+        gt = batch["gt_hand_action"]
 
         out = policy(
             img_main=batch["img_main"],
             img_extra=batch["img_extra"],
-            state=batch["state"],
             past_hand_win=batch["past_hand_win"],
         )
-        arm_loss = F.mse_loss(out["arm_action"], gt[:, :6])
-        hand_loss = F.mse_loss(out["hand_action"], gt[:, 6:])
-        # Drift regularizer: pull BC's hand prediction toward the decoder output
-        # at the frozen prior mean. The decoder is frozen, so gradients flow only
-        # through the corrected hand path.
+        hand_loss = F.mse_loss(out["hand_action"], gt)
         drift_loss = F.mse_loss(out["hand_action"], out["hand_no_corr"])
-        loss = arm_loss + hand_loss + args.reg_drift * drift_loss
+        loss = hand_loss + args.reg_drift * drift_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -434,7 +347,6 @@ def main():
 
         history["steps"].append(step)
         history["train_total"].append(loss.item())
-        history["train_arm"].append(arm_loss.item())
         history["train_hand"].append(hand_loss.item())
         history["train_drift"].append(drift_loss.item())
         history["train_lr"].append(lr_schedule[step])
@@ -442,40 +354,32 @@ def main():
         if step % args.print_freq == 0:
             elapsed = time.time() - t0
             print(f"[Step {step:>5d}] total={loss.item():.6f}  "
-                  f"arm={arm_loss.item():.6f}  hand={hand_loss.item():.6f}  "
+                  f"hand={hand_loss.item():.6f}  "
                   f"drift={drift_loss.item():.6f}  "
                   f"lr={lr_schedule[step]:.2e}  ({elapsed:.0f}s)")
 
         if step > 0 and step % args.eval_freq == 0:
-            ev = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+            ev = evaluate(policy, test_loader, device)
             history["eval_steps"].append(step)
-            history["val_arm"].append(ev["arm_mse"])
             history["val_hand_full"].append(ev["hand_mse_full"])
             history["val_hand_no_corr"].append(ev["hand_mse_no_correction"])
-            history["val_total"].append(ev["total_mse"])
             improved = ev["hand_mse_no_correction"] - ev["hand_mse_full"]
-            print(f"           val arm={ev['arm_mse']:.6f}  "
-                  f"hand={ev['hand_mse_full']:.6f}  "
+            print(f"           val hand={ev['hand_mse_full']:.6f}  "
                   f"no_corr={ev['hand_mse_no_correction']:.6f}  "
                   f"vision_gain={improved:+.6f}")
 
         if step > 0 and step % args.save_freq == 0:
-            save_checkpoint(policy, optimizer, step, args.output_dir,
-                            action_mean, action_std, args)
+            save_checkpoint(policy, optimizer, step, args.output_dir, args)
             print(f"           checkpoint saved -> {args.output_dir}/checkpoint-{step}.pth")
 
     # ── Final eval + save ──
-    save_checkpoint(policy, optimizer, args.total_steps, args.output_dir,
-                    action_mean, action_std, args)
-    ev = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+    save_checkpoint(policy, optimizer, args.total_steps, args.output_dir, args)
+    ev = evaluate(policy, test_loader, device)
     history["eval_steps"].append(args.total_steps)
-    history["val_arm"].append(ev["arm_mse"])
     history["val_hand_full"].append(ev["hand_mse_full"])
     history["val_hand_no_corr"].append(ev["hand_mse_no_correction"])
-    history["val_total"].append(ev["total_mse"])
 
-    print(f"\nFinal val: arm={ev['arm_mse']:.6f}  "
-          f"hand={ev['hand_mse_full']:.6f}  "
+    print(f"\nFinal val: hand={ev['hand_mse_full']:.6f}  "
           f"no_corr={ev['hand_mse_no_correction']:.6f}  "
           f"vision_gain={ev['hand_mse_no_correction'] - ev['hand_mse_full']:+.6f}")
     print(f"  Vision-corrected hand prediction "

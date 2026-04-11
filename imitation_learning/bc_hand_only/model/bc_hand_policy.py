@@ -1,20 +1,16 @@
 """
-Behavior cloning policy over a frozen Hand-Action VAE.
+Hand-only behavior cloning policy over a frozen Hand-Action VAE.
 
-Current design (3.0):
+Decoupled hand branch extracted from the full BC 3.0 policy for diagnostic
+purposes. No arm components — only vision + VAE prior -> delta_z correction.
 
-- image -> CNNs -> shared visual feature
-- arm state (first 6 dims of standardized state) -> dedicated arm-state encoder
-- frozen VAE prior from past_hand_win -> (mu_prior, log_var_prior)
-- hand prior (mu_prior, log_var_prior) -> dedicated hand-prior encoder
-- arm branch predicts the next 6-dim arm action from {visual, arm_state_latent}
-- hand branch predicts delta_z from {visual, hand_prior_latent} and optionally
-  receives the arm-state latent as an additional condition
-- controlled latent is z_ctrl = mu_prior + delta_z
-- frozen decoder maps z_ctrl -> hand_action
-
-This keeps the arm and hand branches weakly coupled: they still share vision,
-but they no longer share a single high-level state trunk.
+Pipeline:
+  img_main, img_extra -> CNNs -> visual_fusion -> visual_feat (feat_dim)
+  past_hand_win       -> frozen VAE encoder -> (mu_prior, log_var_prior)
+                      -> hand_prior_encoder -> hand_prior_feat (feat_dim)
+  [visual_feat, hand_prior_feat] -> hand_delta_z_head -> delta_z
+  z_ctrl = mu_prior + delta_z
+  hand_action = frozen_vae.decode(z_ctrl)
 """
 
 import importlib.util
@@ -26,8 +22,8 @@ import torch.nn as nn
 
 # ─── VAE loader ────────────────────────────────────────────────────────────────
 
-_BC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PROJ_ROOT = os.path.abspath(os.path.join(_BC_ROOT, "..", ".."))
+_BC_HAND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJ_ROOT = os.path.abspath(os.path.join(_BC_HAND_ROOT, "..", ".."))
 _VAE_ROOT = os.path.join(_PROJ_ROOT, "vae")
 
 
@@ -65,7 +61,7 @@ def build_and_freeze_vae(ckpt_path: str) -> nn.Module:
 
 
 class SimpleCNN(nn.Module):
-    """4-block CNN with GroupNorm. Input (B, 3, 128, 128) → (B, out_dim)."""
+    """4-block CNN with GroupNorm. Input (B, 3, 128, 128) -> (B, out_dim)."""
 
     def __init__(self, out_dim: int = 128):
         super().__init__()
@@ -92,31 +88,25 @@ class SimpleCNN(nn.Module):
         return self.net(x)
 
 
-# ─── BC policy ─────────────────────────────────────────────────────────────────
+# ─── Hand-only BC policy ─────────────────────────────────────────────────────
 
 
-class BCPolicy(nn.Module):
-    """Behavior cloning policy with weakly-coupled arm and hand branches."""
+class BCHandPolicy(nn.Module):
+    """Hand-only behavior cloning policy: vision + VAE prior -> delta_z."""
 
     def __init__(
         self,
         vae: nn.Module,
-        state_dim: int = 12,
-        arm_state_dim: int = 6,
         feat_dim: int = 128,
         fusion_dim: int = 256,
         disable_vision: bool = False,
         dropout: float = 0.0,
-        hand_condition_on_arm: bool = False,
     ):
         super().__init__()
         self.vae = vae
         self.latent_dim = vae.latent_dim
-        self.state_dim = state_dim
-        self.arm_state_dim = arm_state_dim
         self.feat_dim = feat_dim
         self.disable_vision = disable_vision
-        self.hand_condition_on_arm = hand_condition_on_arm
 
         self.cnn_main = SimpleCNN(out_dim=feat_dim)
         self.cnn_extra = SimpleCNN(out_dim=feat_dim)
@@ -133,13 +123,6 @@ class BCPolicy(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.arm_state_encoder = nn.Sequential(
-            nn.Linear(arm_state_dim, feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim),
-            nn.ReLU(inplace=True),
-        )
-
         self.hand_prior_encoder = nn.Sequential(
             nn.Linear(2 * self.latent_dim, feat_dim),
             nn.ReLU(inplace=True),
@@ -147,26 +130,8 @@ class BCPolicy(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        arm_layers = [
-            nn.Linear(feat_dim * 2, fusion_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(fusion_dim, fusion_dim),
-            nn.ReLU(inplace=True),
-        ]
-        if dropout > 0:
-            arm_layers.append(nn.Dropout(dropout))
-        arm_layers.extend([
-            nn.Linear(fusion_dim, 128),
-            nn.ReLU(inplace=True),
-        ])
-        if dropout > 0:
-            arm_layers.append(nn.Dropout(dropout))
-        arm_layers.append(nn.Linear(128, 6))
-        self.arm_head = nn.Sequential(*arm_layers)
-
-        hand_in_dim = feat_dim * (3 if hand_condition_on_arm else 2)
         hand_layers = [
-            nn.Linear(hand_in_dim, fusion_dim),
+            nn.Linear(feat_dim * 2, fusion_dim),
             nn.ReLU(inplace=True),
             nn.Linear(fusion_dim, 64),
             nn.ReLU(inplace=True),
@@ -212,31 +177,21 @@ class BCPolicy(nn.Module):
         self,
         img_main: torch.Tensor,
         img_extra: torch.Tensor,
-        state: torch.Tensor,
         past_hand_win: torch.Tensor,
         zero_delta: bool = False,
     ):
-        """Run the weakly-coupled BC policy.
+        """Run the hand-only BC policy.
 
         Args:
             img_main, img_extra: (B, 3, 128, 128) float in [0, 1]
-            state: (B, 12) standardized actions[t]; only the first 6 arm dims are used
             past_hand_win: (B, 8, 6) past hand actions [a_{t-7}..a_t]
             zero_delta: if True, force delta_z = 0 for the no-correction baseline
 
         Returns:
-            dict with arm_action, hand_action, hand_no_corr, action_pred,
-            mu_prior, log_var_prior, delta_z, z_ctrl, z_no_corr.
+            dict with hand_action, hand_no_corr, mu_prior, log_var_prior,
+            delta_z, z_ctrl, z_no_corr, visual_feat, hand_prior_feat.
         """
-        if state.shape[-1] < self.arm_state_dim:
-            raise ValueError(
-                f"Expected state with at least {self.arm_state_dim} dims, got {tuple(state.shape)}"
-            )
-
         visual_feat = self.encode_visual(img_main, img_extra)
-        arm_state = state[..., :self.arm_state_dim]
-        arm_state_feat = self.arm_state_encoder(arm_state)
-        arm_action = self.arm_head(torch.cat([visual_feat, arm_state_feat], dim=-1))
 
         with torch.no_grad():
             mu_p, lv_p = self.vae.encode(past_hand_win)
@@ -245,10 +200,7 @@ class BCPolicy(nn.Module):
         if zero_delta:
             delta_z = torch.zeros_like(mu_p)
         else:
-            pieces = [visual_feat, hand_prior_feat]
-            if self.hand_condition_on_arm:
-                pieces.append(arm_state_feat)
-            hand_latent_input = torch.cat(pieces, dim=-1)
+            hand_latent_input = torch.cat([visual_feat, hand_prior_feat], dim=-1)
             delta_z = self.hand_delta_z_head(hand_latent_input)
 
         z_ctrl = mu_p + delta_z
@@ -256,20 +208,16 @@ class BCPolicy(nn.Module):
 
         hand_action = self.vae.decode(z_ctrl)
         hand_no_corr = self.vae.decode(z_no_corr)
-        action_pred = torch.cat([arm_action, hand_action], dim=-1)
 
         return {
-            "arm_action": arm_action,
             "hand_action": hand_action,
             "hand_no_corr": hand_no_corr,
-            "action_pred": action_pred,
             "mu_prior": mu_p,
             "log_var_prior": lv_p,
             "delta_z": delta_z,
             "z_ctrl": z_ctrl,
             "z_no_corr": z_no_corr,
             "visual_feat": visual_feat,
-            "arm_state_feat": arm_state_feat,
             "hand_prior_feat": hand_prior_feat,
         }
 
@@ -280,5 +228,5 @@ def trainable_params(module: nn.Module):
 
 
 def strip_vae_state_dict(state_dict: dict) -> dict:
-    """Drop keys starting with 'vae.' so BC checkpoints exclude frozen VAE weights."""
+    """Drop keys starting with 'vae.' so checkpoints exclude frozen VAE weights."""
     return {k: v for k, v in state_dict.items() if not k.startswith("vae.")}
