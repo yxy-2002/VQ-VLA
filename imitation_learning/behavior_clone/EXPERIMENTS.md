@@ -29,6 +29,60 @@ training_curves.png 路径。
 
 ---
 
+## 2026-04-11 · v7 arm noise sweep — arm state 训练噪声对 AR 性能的影响
+
+### 动机
+
+v6 解决了 hand 分支的 AR drift（noise_std_hand=0.1），但 arm 的 AR MSE 仍为 0.098（copy baseline 0.030）。arm state 在 AR 模式下同样被自身预测替换，存在相同的训练-部署分布不匹配问题。本次在 z-score 归一化后的 arm state[:6] 上加噪声，验证能否改善 arm AR 性能。
+
+### 代码改动
+
+- `model/bc_dataset.py` — 新增 `noise_std_arm` 参数，对 state[:6] 加 N(0, noise_std_arm)
+- `scripts/train.py` — 新增 `--noise_std_arm` CLI，默认值设为 0.1
+
+### 数据
+
+同 v6。
+
+### 配置
+
+固定 noise_std_hand=0.1，扫描 noise_std_arm：
+
+| Tag | noise_std_arm |
+|-----|---------------|
+| arm001 | 0.01 |
+| arm003 | 0.03 |
+| arm005 | 0.05 |
+| arm01 | 0.10 |
+| arm02 | 0.20 |
+| arm03 | 0.30 |
+
+### 结果
+
+**AR 评估（对比 baseline: arm_noise=0, hand_noise=0.1, AR arm=0.098）：**
+
+| arm_noise | AR arm MSE | AR hand MSE | arm 改善 |
+|-----------|-----------|------------|---------|
+| 0 (v6 baseline) | 0.098 | 0.014 | — |
+| 0.01 | 0.084 | 0.016 | -14% |
+| 0.03 | 0.077 | 0.015 | -21% |
+| 0.05 | 0.077 | 0.014 | -21% |
+| **0.10** | **0.071** | 0.014 | **-27%** |
+| 0.20 | 0.067 | 0.014 | -31% |
+| 0.30 | 0.070 | 0.017 | -29% |
+
+Checkpoints：`outputs/bc_v7_arm_noise/{arm001,...,arm03}/checkpoint.pth`
+可视化：`visualizations/bc_v7_arm_noise/{arm001,...,arm03}/`
+
+### 关键发现
+
+1. **arm noise 有效**：AR arm MSE 从 0.098 单调降到 0.067（arm_noise=0.2），改善 31%。
+2. **最优区间 0.1~0.2**：0.2 arm 最优但 0.1 也接近（0.071 vs 0.067），0.3 开始退化且 hand 变差（0.017）。
+3. **hand 不受影响**：arm noise 不干扰 hand 分支（AR hand MSE 稳定在 0.014）。
+4. **默认参数更新为 noise_std_arm=0.1**：在 arm 性能和稳定性之间取平衡，与 noise_std_hand=0.1 对称。
+
+---
+
 ## 2026-04-11 · v6 noise sweep — past_hand_win 训练噪声对 AR 性能的影响
 
 ### 动机

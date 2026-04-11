@@ -83,6 +83,9 @@ def get_args():
                    help="Gaussian noise std on past_hand_win during training. "
                         "Critical for AR robustness — without noise the model "
                         "drifts catastrophically in autoregressive mode.")
+    p.add_argument("--noise_std_arm", type=float, default=0.1,
+                   help="Gaussian noise std on z-score normalized arm state[:6] "
+                        "during training. Mitigates AR drift on arm branch.")
     p.add_argument("--reg_drift", type=float, default=1.0,
                    help="Weight on the hand-drift regularizer "
                         "MSE(hand_action, hand_no_corr). hand_no_corr is the frozen "
@@ -282,11 +285,13 @@ def main():
         args.train_dir, action_mean=action_mean, action_std=action_std,
         window_size=args.window_size,
         noise_std_hand=args.noise_std_hand,
+        noise_std_arm=args.noise_std_arm,
     )
     test_ds = BCDataset(
         args.test_dir, action_mean=action_mean, action_std=action_std,
         window_size=args.window_size,
         noise_std_hand=0.0,   # never noise the eval split
+        noise_std_arm=0.0,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -306,7 +311,7 @@ def main():
         fusion_dim=args.fusion_dim,
         dropout=args.dropout,
     ).to(device)
-    print(f"[Aug] noise_std_hand={args.noise_std_hand}")
+    print(f"[Aug] noise_std_hand={args.noise_std_hand}  noise_std_arm={args.noise_std_arm}")
     print("[Arch] BC 3.0 — weakly-coupled arm/hand branches, hand conditioned on arm.")
 
     n_total = sum(p.numel() for p in policy.parameters())

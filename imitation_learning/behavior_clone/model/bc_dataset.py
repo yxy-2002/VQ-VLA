@@ -85,6 +85,7 @@ class BCDataset(Dataset):
         action_std: torch.Tensor,
         window_size: int = 8,
         noise_std_hand: float = 0.1,
+        noise_std_arm: float = 0.0,
     ):
         data_dir = Path(data_dir)
         traj_files = sorted(data_dir.glob("trajectory_*_demo_expert.pt"))
@@ -95,6 +96,7 @@ class BCDataset(Dataset):
         self.action_mean = action_mean.clone().float()
         self.action_std = action_std.clone().float()
         self.noise_std_hand = float(noise_std_hand)
+        self.noise_std_arm = float(noise_std_arm)
 
         # Per-trajectory tensors (preloaded into RAM)
         self.actions = []     # list of (T, 12) float32
@@ -143,6 +145,10 @@ class BCDataset(Dataset):
         # state = actions[t] (current absolute pose), z-score normalized and
         # optionally ablated to test whether timing is leaking through state.
         state = (actions[t] - self.action_mean) / self.action_std  # (12,)
+        # Optional Gaussian noise on arm state (training only — set 0 for test)
+        if self.noise_std_arm > 0:
+            state = state.clone()
+            state[:6] = state[:6] + torch.randn(6) * self.noise_std_arm
 
         # ── Frozen VAE input (NOT a BC trainable input) ──
         # past_hand_win = 8 frames [a_{t-7}..a_t] inclusive of current frame.

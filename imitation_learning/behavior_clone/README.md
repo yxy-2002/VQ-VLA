@@ -41,16 +41,33 @@ drift_loss = MSE(hand_action, hand_no_corr)
 total_loss = arm_loss + hand_loss + reg_drift * drift_loss
 ```
 
-## 关键训练技巧：past_hand_win 噪声注入
+## 关键训练技巧：输入噪声注入
 
-训练时必须给 `past_hand_win` 添加高斯噪声（`--noise_std_hand`，默认 0.1），否则模型在 AR 模式下因误差累积而完全崩溃。
+训练时必须给 AR 反馈链路上的输入添加高斯噪声，否则模型在 AR 模式下因误差累积而崩溃。
 
-| noise_std | AR arm MSE | AR hand MSE | hand vision_gain |
-|-----------|-----------|------------|-----------------|
+- **`--noise_std_hand 0.1`**：加在 `past_hand_win`（raw action space），解决 hand 分支 AR drift
+- **`--noise_std_arm 0.1`**：加在 z-score 归一化后的 `state[:6]`，解决 arm 分支 AR drift
+
+### hand noise sweep (固定 arm_noise=0)
+
+| hand_noise | AR arm MSE | AR hand MSE | hand vision_gain |
+|------------|-----------|------------|-----------------|
 | 0.00 | 0.061 | 0.086 (= no_corr) | -0.037 |
 | 0.03 | 0.091 | 0.023 | +0.063 |
 | 0.05 | 0.088 | 0.020 | +0.066 |
 | **0.10** | 0.098 | **0.014** | **+0.072** |
+
+### arm noise sweep (固定 hand_noise=0.1)
+
+| arm_noise | AR arm MSE | AR hand MSE | arm 改善 vs baseline |
+|-----------|-----------|------------|---------------------|
+| 0 (baseline) | 0.098 | 0.014 | — |
+| 0.01 | 0.084 | 0.016 | -14% |
+| 0.03 | 0.077 | 0.015 | -21% |
+| 0.05 | 0.077 | 0.014 | -21% |
+| **0.10** | **0.071** | 0.014 | **-27%** |
+| 0.20 | 0.067 | 0.014 | -31% |
+| 0.30 | 0.070 | 0.017 | -29% |
 
 ## Quick Start
 
@@ -62,16 +79,27 @@ total_loss = arm_loss + hand_loss + reg_drift * drift_loss
     --train_dir data/20260327-11:10:43/demos/success/train \
     --test_dir  data/20260327-11:10:43/demos/success/test \
     --vae_ckpt  outputs/dim_2_best/checkpoint.pth \
-    --output_dir outputs/bc_v6_noise/noise01
+    --output_dir outputs/bc_output
 ```
 
-默认已包含 `--noise_std_hand 0.1` 和 `--reg_drift 1.0`。
+默认已包含 `--noise_std_hand 0.1`、`--noise_std_arm 0.1` 和 `--reg_drift 1.0`。
+
+### 评估（AR + 可视化）
+
+```bash
+/home/cxl/miniconda3/envs/serl/bin/python \
+    imitation_learning/behavior_clone/scripts/eval.py \
+    --ckpt outputs/bc_output/checkpoint.pth \
+    --output_dir visualizations/bc_output \
+    --num_samples 5
+```
 
 ## 超参默认值
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| noise_std_hand | **0.1** | past_hand_win 训练噪声，AR 鲁棒性关键参数 |
+| noise_std_hand | **0.1** | past_hand_win 训练噪声，hand AR 鲁棒性关键参数 |
+| noise_std_arm | **0.1** | arm state 训练噪声，arm AR 鲁棒性关键参数 |
 | reg_drift | 1.0 | drift 正则化权重 |
 | lr | 5e-4 | |
 | batch_size | 128 | |
@@ -97,9 +125,8 @@ behavior_clone/
 │   ├── bc_policy.py       # BCPolicy 模型定义
 │   └── bc_dataset.py      # BCDataset 数据集
 ├── scripts/
-│   └── train.py           # 训练脚本
+│   ├── train.py           # 训练脚本
+│   └── eval.py            # AR 评估 + 可视化
 ├── README.md
 └── EXPERIMENTS.md
 ```
-
-评估脚本位于 `bc_hand_only/scripts/eval.py`（hand-only 版本）。完整模型的 AR 评估可参考该脚本或使用已保存的可视化结果（`visualizations/bc_v6_noise/`）。
