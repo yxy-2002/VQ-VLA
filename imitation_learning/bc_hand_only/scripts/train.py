@@ -73,8 +73,10 @@ def get_args():
     p.add_argument("--total_steps", type=int, default=20000)
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--clip_grad", type=float, default=1.0)
-    p.add_argument("--noise_std_hand", type=float, default=0.0,
-                   help="Gaussian noise std on past_hand_win during training")
+    p.add_argument("--noise_std_hand", type=float, default=0.05,
+                   help="Gaussian noise std on past_hand_win during training. "
+                        "Critical for AR robustness — without noise the model "
+                        "drifts catastrophically in autoregressive mode.")
     p.add_argument("--disable_vision", action="store_true",
                    help="Ablation: zero out CNN features and freeze CNN params")
     p.add_argument("--reg_drift", type=float, default=1.0,

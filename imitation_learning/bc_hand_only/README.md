@@ -45,6 +45,14 @@ drift_loss = MSE(hand_action, hand_no_corr)       # delta_z 正则化
 total_loss = hand_loss + reg_drift * drift_loss
 ```
 
+## 关键训练技巧：past_hand_win 噪声注入
+
+训练时必须给 `past_hand_win` 添加高斯噪声（`--noise_std_hand`，默认 0.05），否则模型在 AR 模式下会因误差累积而完全崩溃。
+
+原因：不加噪时模型只见过 GT 手部历史，无法应对 AR 反馈中自身预测引入的分布偏移。加噪后模型在训练中就暴露于扰动的手部历史，学会了鲁棒的修正策略。
+
+Sweep 实验表明 noise_std ∈ [0.02, 0.20] 都有效，0.05 在 AR 性能和稳定性之间取得较好平衡。
+
 ## Quick Start
 
 ### 训练
@@ -55,8 +63,10 @@ total_loss = hand_loss + reg_drift * drift_loss
     --train_dir data/20260327-11:10:43/demos/success/train \
     --test_dir  data/20260327-11:10:43/demos/success/test \
     --vae_ckpt  outputs/dim_2_best/checkpoint.pth \
-    --output_dir outputs/bc_hand_only_sweep/baseline
+    --output_dir outputs/bc_hand_only
 ```
+
+默认已包含 `--noise_std_hand 0.05`，无需额外指定。
 
 ### 评估（AR + 可视化）
 
@@ -98,6 +108,7 @@ bash imitation_learning/bc_hand_only/scripts/sweep.sh
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| noise_std_hand | **0.05** | past_hand_win 训练噪声，AR 鲁棒性关键参数 |
 | lr | 5e-4 | 与 BC 3.0 一致 |
 | batch_size | 128 | |
 | total_steps | 20000 | |
@@ -105,6 +116,17 @@ bash imitation_learning/bc_hand_only/scripts/sweep.sh
 | feat_dim | 128 | 特征维度 |
 | fusion_dim | 256 | MLP 隐层宽度 |
 | dropout | 0.0 | hand delta-z head 的 dropout |
+
+### noise_std_hand sweep 结果参考
+
+| noise_std | AR hand MSE | vision_gain |
+|-----------|------------|-------------|
+| 0.00 (baseline) | 0.1226 | -0.037 |
+| 0.01 | 0.0857 | -0.000 |
+| 0.02 | 0.0207 | +0.065 |
+| **0.05** | **0.0183** | **+0.067** |
+| 0.10 | 0.0155 | +0.070 |
+| 0.20 | 0.0138 | +0.072 |
 
 ## 文件结构
 
