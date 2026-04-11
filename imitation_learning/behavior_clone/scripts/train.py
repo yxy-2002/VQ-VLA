@@ -69,11 +69,7 @@ def get_args():
                    help="Per-branch feature width before fusion")
     p.add_argument("--fusion_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0,
-                   help="Dropout probability in the arm/head MLPs. "
-                        "0 = off. Helps reduce overfitting on the small BC dataset.")
-    p.add_argument("--hand_condition_on_arm", action="store_true",
-                   help="If set, the hand branch also receives the encoded arm-state latent. "
-                        "If unset, the hand branch sees only vision + VAE prior latent.")
+                   help="Dropout probability in the arm/head MLPs")
     # Training
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=5e-4,
@@ -83,21 +79,10 @@ def get_args():
     p.add_argument("--total_steps", type=int, default=20000)
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--clip_grad", type=float, default=1.0)
-    p.add_argument("--noise_std_hand", type=float, default=0.0,
-                   help="Gaussian noise std added to past_hand_win during training "
-                        "only (test split always 0). Trains the BC to be robust to "
-                        "small perturbations in the hand history input — partial "
-                        "mitigation of AR drift. Matches the VAE convention.")
-    p.add_argument("--disable_vision", action="store_true",
-                   help="Ablation: zero out CNN features and freeze CNN params. "
-                        "BC sees only state + past_hand_win. Used to check "
-                        "whether the vision input contributes anything beyond "
-                        "the 12-dim absolute pose.")
-    p.add_argument("--state_mask", type=str, default="all",
-                   choices=["all", "arm_only", "none"],
-                   help="Ablation over the standardized 12-dim state input. "
-                        "In BC 3.0 only the first 6 arm dims are consumed, so "
-                        "all and arm_only are equivalent; none zeros the arm state too.")
+    p.add_argument("--noise_std_hand", type=float, default=0.1,
+                   help="Gaussian noise std on past_hand_win during training. "
+                        "Critical for AR robustness — without noise the model "
+                        "drifts catastrophically in autoregressive mode.")
     p.add_argument("--reg_drift", type=float, default=1.0,
                    help="Weight on the hand-drift regularizer "
                         "MSE(hand_action, hand_no_corr). hand_no_corr is the frozen "
@@ -111,8 +96,6 @@ def get_args():
     p.add_argument("--print_freq", type=int, default=200)
     p.add_argument("--eval_freq", type=int, default=1000)
     p.add_argument("--save_freq", type=int, default=5000)
-    p.add_argument("--eval_samples", type=int, default=3,
-                   help="Kept for compatibility; current hand path is deterministic")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -122,14 +105,8 @@ def get_args():
 
 
 @torch.no_grad()
-def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device,
-             eval_samples: int = 3) -> dict:
-    """Eval set MSE for arm, hand, and the no-correction baseline (delta_z = 0).
-
-    eval_samples is kept only for CLI/checkpoint compatibility; the current hand
-    path is deterministic, so evaluation uses a single forward pass.
-    """
-    del eval_samples
+def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device) -> dict:
+    """Eval set MSE for arm, hand, and the no-correction baseline (delta_z = 0)."""
     policy.eval()
 
     sums = {"arm": 0.0, "hand_full": 0.0, "hand_no_corr": 0.0, "n": 0}
@@ -305,13 +282,11 @@ def main():
         args.train_dir, action_mean=action_mean, action_std=action_std,
         window_size=args.window_size,
         noise_std_hand=args.noise_std_hand,
-        state_mask=args.state_mask,
     )
     test_ds = BCDataset(
         args.test_dir, action_mean=action_mean, action_std=action_std,
         window_size=args.window_size,
         noise_std_hand=0.0,   # never noise the eval split
-        state_mask=args.state_mask,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -326,27 +301,13 @@ def main():
     vae = build_and_freeze_vae(args.vae_ckpt)
     policy = BCPolicy(
         vae=vae,
-        state_dim=12,   # kept for compatibility; policy uses the first 6 arm dims
         arm_state_dim=6,
         feat_dim=args.feat_dim,
         fusion_dim=args.fusion_dim,
-        disable_vision=args.disable_vision,
         dropout=args.dropout,
-        hand_condition_on_arm=args.hand_condition_on_arm,
     ).to(device)
-    if args.disable_vision:
-        print("[Ablation] disable_vision=True — CNN outputs forced to 0, "
-              "CNN params frozen, BC sees only state + past_hand_win.")
-    if args.noise_std_hand > 0:
-        print(f"[Aug] noise_std_hand={args.noise_std_hand} — train past_hand_win "
-              f"will get N(0, {args.noise_std_hand}) noise per __getitem__.")
-    if args.state_mask != "all":
-        print(f"[Ablation] state_mask={args.state_mask} — standardized state input "
-              "will be masked before entering the BC encoder.")
-    print(
-        "[Arch] BC 3.0 — weakly-coupled arm/hand branches, "
-        f"hand_condition_on_arm={args.hand_condition_on_arm}."
-    )
+    print(f"[Aug] noise_std_hand={args.noise_std_hand}")
+    print("[Arch] BC 3.0 — weakly-coupled arm/hand branches, hand conditioned on arm.")
 
     n_total = sum(p.numel() for p in policy.parameters())
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -380,7 +341,7 @@ def main():
     policy.train()
 
     print("[Sanity] Step-0 evaluation:")
-    init_eval = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+    init_eval = evaluate(policy, test_loader, device)
     print(f"  arm_mse                = {init_eval['arm_mse']:.6f}")
     print(f"  hand_mse_full          = {init_eval['hand_mse_full']:.6f}")
     print(f"  hand_mse_no_correction = {init_eval['hand_mse_no_correction']:.6f}")
@@ -447,7 +408,7 @@ def main():
                   f"lr={lr_schedule[step]:.2e}  ({elapsed:.0f}s)")
 
         if step > 0 and step % args.eval_freq == 0:
-            ev = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+            ev = evaluate(policy, test_loader, device)
             history["eval_steps"].append(step)
             history["val_arm"].append(ev["arm_mse"])
             history["val_hand_full"].append(ev["hand_mse_full"])
@@ -467,7 +428,7 @@ def main():
     # ── Final eval + save ──
     save_checkpoint(policy, optimizer, args.total_steps, args.output_dir,
                     action_mean, action_std, args)
-    ev = evaluate(policy, test_loader, device, eval_samples=args.eval_samples)
+    ev = evaluate(policy, test_loader, device)
     history["eval_steps"].append(args.total_steps)
     history["val_arm"].append(ev["arm_mse"])
     history["val_hand_full"].append(ev["hand_mse_full"])

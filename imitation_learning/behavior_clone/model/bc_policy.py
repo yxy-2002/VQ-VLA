@@ -96,35 +96,28 @@ class SimpleCNN(nn.Module):
 
 
 class BCPolicy(nn.Module):
-    """Behavior cloning policy with weakly-coupled arm and hand branches."""
+    """Behavior cloning policy with weakly-coupled arm and hand branches.
+
+    The hand branch always receives the encoded arm-state latent as an
+    additional condition (hand_condition_on_arm=True in prior versions).
+    """
 
     def __init__(
         self,
         vae: nn.Module,
-        state_dim: int = 12,
         arm_state_dim: int = 6,
         feat_dim: int = 128,
         fusion_dim: int = 256,
-        disable_vision: bool = False,
         dropout: float = 0.0,
-        hand_condition_on_arm: bool = False,
     ):
         super().__init__()
         self.vae = vae
         self.latent_dim = vae.latent_dim
-        self.state_dim = state_dim
         self.arm_state_dim = arm_state_dim
         self.feat_dim = feat_dim
-        self.disable_vision = disable_vision
-        self.hand_condition_on_arm = hand_condition_on_arm
 
         self.cnn_main = SimpleCNN(out_dim=feat_dim)
         self.cnn_extra = SimpleCNN(out_dim=feat_dim)
-        if disable_vision:
-            for p in self.cnn_main.parameters():
-                p.requires_grad_(False)
-            for p in self.cnn_extra.parameters():
-                p.requires_grad_(False)
 
         self.visual_fusion = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
@@ -164,9 +157,9 @@ class BCPolicy(nn.Module):
         arm_layers.append(nn.Linear(128, 6))
         self.arm_head = nn.Sequential(*arm_layers)
 
-        hand_in_dim = feat_dim * (3 if hand_condition_on_arm else 2)
+        # Hand branch always conditions on arm_state_feat (3 * feat_dim input)
         hand_layers = [
-            nn.Linear(hand_in_dim, fusion_dim),
+            nn.Linear(feat_dim * 3, fusion_dim),
             nn.ReLU(inplace=True),
             nn.Linear(fusion_dim, 64),
             nn.ReLU(inplace=True),
@@ -196,14 +189,6 @@ class BCPolicy(nn.Module):
         img_main: torch.Tensor,
         img_extra: torch.Tensor,
     ) -> torch.Tensor:
-        if self.disable_vision:
-            batch_size = img_main.shape[0]
-            return torch.zeros(
-                batch_size,
-                self.feat_dim,
-                device=img_main.device,
-                dtype=img_main.dtype,
-            )
         f_main = self.cnn_main(img_main)
         f_extra = self.cnn_extra(img_extra)
         return self.visual_fusion(torch.cat([f_main, f_extra], dim=-1))
@@ -220,7 +205,7 @@ class BCPolicy(nn.Module):
 
         Args:
             img_main, img_extra: (B, 3, 128, 128) float in [0, 1]
-            state: (B, 12) standardized actions[t]; only the first 6 arm dims are used
+            state: (B, >=6) standardized actions[t]; only the first 6 arm dims are used
             past_hand_win: (B, 8, 6) past hand actions [a_{t-7}..a_t]
             zero_delta: if True, force delta_z = 0 for the no-correction baseline
 
@@ -228,11 +213,6 @@ class BCPolicy(nn.Module):
             dict with arm_action, hand_action, hand_no_corr, action_pred,
             mu_prior, log_var_prior, delta_z, z_ctrl, z_no_corr.
         """
-        if state.shape[-1] < self.arm_state_dim:
-            raise ValueError(
-                f"Expected state with at least {self.arm_state_dim} dims, got {tuple(state.shape)}"
-            )
-
         visual_feat = self.encode_visual(img_main, img_extra)
         arm_state = state[..., :self.arm_state_dim]
         arm_state_feat = self.arm_state_encoder(arm_state)
@@ -245,10 +225,9 @@ class BCPolicy(nn.Module):
         if zero_delta:
             delta_z = torch.zeros_like(mu_p)
         else:
-            pieces = [visual_feat, hand_prior_feat]
-            if self.hand_condition_on_arm:
-                pieces.append(arm_state_feat)
-            hand_latent_input = torch.cat(pieces, dim=-1)
+            hand_latent_input = torch.cat(
+                [visual_feat, hand_prior_feat, arm_state_feat], dim=-1,
+            )
             delta_z = self.hand_delta_z_head(hand_latent_input)
 
         z_ctrl = mu_p + delta_z

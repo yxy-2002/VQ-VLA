@@ -29,6 +29,71 @@ training_curves.png 路径。
 
 ---
 
+## 2026-04-11 · v6 noise sweep — past_hand_win 训练噪声对 AR 性能的影响
+
+### 动机
+
+hand-only 解耦实验（`bc_hand_only/`）发现：
+1. 问题不在 arm/hand 耦合，而在训练-部署分布不匹配（AR drift）
+2. 给 past_hand_win 加噪声 (noise_std_hand ≥ 0.02) 可以大幅改善 AR 手部性能
+3. 之前 v3 只试过 noise=0.01（无效），未尝试更大值
+
+本次将 noise 发现带回完整 BC 3.0 模型（含 arm + hand），验证噪声在完整架构下是否同样有效。
+
+### 代码改动
+
+- `scripts/train.py` — `--noise_std_hand` 默认值改为 0.1
+- `model/bc_policy.py` — 移除 `disable_vision`、`hand_condition_on_arm`（硬编码为 True）
+- `model/bc_dataset.py` — 移除 `apply_state_mask`/`state_mask`，`noise_std_hand` 默认值改为 0.1
+- 删除调试脚本：eval.py, plot_ar_eval.py, sweep_v4_full.sh, sweep_v5_arm_share.sh
+
+### 数据
+
+同 v5。train 120 trajectories / test 30 trajectories。copy baseline: arm=0.0297, hand=0.00464。
+
+### 配置
+
+基准：lr=5e-4, batch=128, steps=20000, reg_drift=1.0, dropout=0.0, hand_condition_on_arm=True
+
+3 组实验只变 `--noise_std_hand`：
+
+| Tag | noise_std_hand |
+|-----|----------------|
+| noise003 | 0.03 |
+| noise005 | 0.05 |
+| noise01 | 0.10 |
+
+### 结果
+
+**AR 评估（deployment proxy）：**
+
+| noise_std | AR arm MSE | AR hand MSE | nc_hand | hand vision_gain |
+|-----------|-----------|------------|---------|-----------------|
+| 0.03 | 0.0906 | 0.0231 | 0.0857 | +0.063 |
+| 0.05 | 0.0878 | 0.0200 | 0.0857 | +0.066 |
+| **0.10** | 0.0979 | **0.0140** | 0.0857 | **+0.072** |
+
+**TF 评估：**
+
+| noise_std | TF arm MSE | TF hand MSE |
+|-----------|-----------|------------|
+| 0.03 | 0.0278 | 0.00295 |
+| 0.05 | 0.0268 | 0.00333 |
+| 0.10 | 0.0282 | 0.00378 |
+
+可视化路径：`visualizations/bc_v6_noise/{noise003,noise005,noise01}_full/`
+Checkpoints：`outputs/bc_v6_noise/{noise003,noise005,noise01}/checkpoint.pth`
+
+### 关键发现
+
+1. **noise 在完整 BC 3.0 上同样有效**：三组的 AR hand MSE (0.014~0.023) 都远优于 no_corr (0.086)，与 hand-only 实验结论一致。
+2. **arm 不受 noise 影响**：AR arm MSE 在 0.088~0.098 之间基本持平（噪声只加在 past_hand_win 上）。
+3. **noise=0.10 hand 性能最好** (AR hand 0.014)，但 arm 略差 (0.098)。noise=0.05 是 arm/hand 均衡点 (arm 0.088, hand 0.020)。
+4. **已确认：问题不在 arm/hand 耦合**，hand-only noise=0.10 的 AR hand MSE 为 0.0155，BC 3.0 的为 0.0140，完整模型甚至略好。
+5. **默认参数已更新为 noise_std_hand=0.1**，代码已清理移除历史 ablation 开关。
+
+---
+
 ## 2026-04-11 · v5 sweep — BC 3.0 弱耦合结构，对比 hand 是否共享 arm latent
 
 ### 动机

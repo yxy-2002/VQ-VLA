@@ -68,20 +68,6 @@ def compute_action_stats(data_dir: str):
     return mean, std
 
 
-def apply_state_mask(state: torch.Tensor, state_mask: str) -> torch.Tensor:
-    """Apply a fixed ablation mask to a standardized 12-dim action state."""
-    if state_mask == "all":
-        return state
-    masked = state.clone()
-    if state_mask == "arm_only":
-        masked[..., 6:12] = 0.0
-        return masked
-    if state_mask == "none":
-        masked.zero_()
-        return masked
-    raise ValueError(f"Unsupported state_mask={state_mask!r}")
-
-
 class BCDataset(Dataset):
     """BC dataset: per-step observation + next-action target.
 
@@ -98,18 +84,8 @@ class BCDataset(Dataset):
         action_mean: torch.Tensor,
         action_std: torch.Tensor,
         window_size: int = 8,
-        noise_std_hand: float = 0.0,
-        state_mask: str = "all",
+        noise_std_hand: float = 0.1,
     ):
-        """
-        Args:
-            ...
-            noise_std_hand: if > 0, add Gaussian noise (std=this) to past_hand_win
-                            in __getitem__. Set 0 for test split. Trains the BC
-                            to be robust to small perturbations in the hand
-                            history input — partial mitigation of AR drift.
-            state_mask: fixed ablation over the standardized 12-dim state input.
-        """
         data_dir = Path(data_dir)
         traj_files = sorted(data_dir.glob("trajectory_*_demo_expert.pt"))
         if not traj_files:
@@ -119,7 +95,6 @@ class BCDataset(Dataset):
         self.action_mean = action_mean.clone().float()
         self.action_std = action_std.clone().float()
         self.noise_std_hand = float(noise_std_hand)
-        self.state_mask = str(state_mask)
 
         # Per-trajectory tensors (preloaded into RAM)
         self.actions = []     # list of (T, 12) float32
@@ -168,7 +143,6 @@ class BCDataset(Dataset):
         # state = actions[t] (current absolute pose), z-score normalized and
         # optionally ablated to test whether timing is leaking through state.
         state = (actions[t] - self.action_mean) / self.action_std  # (12,)
-        state = apply_state_mask(state, self.state_mask)
 
         # ── Frozen VAE input (NOT a BC trainable input) ──
         # past_hand_win = 8 frames [a_{t-7}..a_t] inclusive of current frame.

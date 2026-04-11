@@ -1,20 +1,19 @@
 """
-Evaluate Behavior Cloning policy over a frozen Hand-Action VAE.
+AR evaluation for BC 3.0: autoregressive rollout with visualization.
 
-Compared with the original evaluator, this version adds offline diagnostics for
-stage-2 failure analysis:
+For each test trajectory, generates:
+  - traj_{id}_ar_actions.png: 4x3 grid (12 joints) with GT / AR / no-corr
+  - traj_{id}_ar_mse.png: per-step arm + hand MSE
+  - summary_ar.png: bar chart across all trajectories
+  - per_trajectory_hand_mse.png: sorted per-trajectory bars
+  - latent_diagnostics.png: delta_z / mu_prior distributions
+  - summary.json: aggregated metrics
 
-- image counterfactuals (`--image_mode`): normal / zero / stale / shuffle / swap
-- partial feedback (`--feedback_horizon`): only feed back the first K predicted
-  actions in AR mode, then fall back to GT
-- onset slices: report metrics on pre-onset / onset-band / post-onset segments
-- latent debug dumps (`--save_debug_latent`): save prior/controlled latent stats
-
-The evaluator is still offline: even in AR mode it consumes dataset images at
-all steps. Only the action state / hand-history feedback is altered.
-The current BC 3.0 policy only consumes the first 6 state dims for the arm
-branch; the hand branch conditions on the VAE prior and optionally the encoded
-arm-state latent.
+Usage:
+    python imitation_learning/behavior_clone/scripts/eval.py \
+        --ckpt outputs/bc_v6_noise/noise01/checkpoint.pth \
+        --output_dir visualizations/bc_v6_noise/noise01_full \
+        --num_samples 5
 """
 
 import argparse
@@ -22,11 +21,9 @@ import glob
 import importlib.util
 import json
 import os
-from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-
 
 # ─── Path & module loading ────────────────────────────────────────────────────
 
@@ -35,7 +32,7 @@ _BC_ROOT = os.path.dirname(_SCRIPT_DIR)
 _PROJ_ROOT = os.path.abspath(os.path.join(_BC_ROOT, "..", ".."))
 
 
-def _load(path: str, name: str):
+def _load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -46,42 +43,22 @@ _policy_mod = _load(os.path.join(_BC_ROOT, "model/bc_policy.py"), "bc_policy")
 _dataset_mod = _load(os.path.join(_BC_ROOT, "model/bc_dataset.py"), "bc_dataset")
 BCPolicy = _policy_mod.BCPolicy
 build_and_freeze_vae = _policy_mod.build_and_freeze_vae
-apply_state_mask = _dataset_mod.apply_state_mask
-
-
-# ─── Constants ────────────────────────────────────────────────────────────────
 
 ARM_NAMES = [f"arm_{i}" for i in range(6)]
 HAND_NAMES = ["thumb_rot", "thumb_bend", "index", "middle", "ring", "pinky"]
 JOINT_NAMES = ARM_NAMES + HAND_NAMES
 
-MODES = ["tf", "ar", "no_corr"]
-MODE_LABELS = {
-    "tf": "Teacher-Forced",
-    "ar": "AR-hand",
-    "no_corr": "No Correction (VAE prior)",
-}
-MODE_COLORS = {
-    "tf": "tab:green",
-    "ar": "tab:red",
-    "no_corr": "tab:blue",
-}
-IMAGE_MODES = ["normal", "zero", "stale", "shuffle", "swap"]
-SLICE_NAMES = ["pre_onset", "onset_band", "post_onset"]
-
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
 
-def load_trajectory_full(path: str) -> dict:
-    """Load actions + images from a trajectory .pt file (matches BCDataset)."""
+def load_trajectory(path: str) -> dict:
     data = torch.load(path, map_location="cpu", weights_only=False)
     actions = data["actions"][:, 0, :].float()
     main = data["curr_obs"]["main_images"][:, 0].permute(0, 3, 1, 2).contiguous()
     extra = data["curr_obs"]["extra_view_images"][:, 0, 0].permute(0, 3, 1, 2).contiguous()
     traj_id = os.path.basename(path).split("trajectory_")[1].split("_")[0]
     return {
-        "path": path,
         "traj_id": traj_id,
         "actions": actions,
         "imgs_main": main,
@@ -90,8 +67,7 @@ def load_trajectory_full(path: str) -> dict:
     }
 
 
-def build_past_window(hand_seq: torch.Tensor, t: int, window_size: int = 8) -> torch.Tensor:
-    """Past hand window [a_{t-7}..a_t] inclusive of current frame."""
+def build_past_window(hand_seq: torch.Tensor, t: int, window_size: int = 8):
     start = t - window_size + 1
     if start < 0:
         pad_len = -start
@@ -99,817 +75,497 @@ def build_past_window(hand_seq: torch.Tensor, t: int, window_size: int = 8) -> t
     return hand_seq[start:t + 1]
 
 
-# ─── Onset diagnostics ────────────────────────────────────────────────────────
+# ─── AR rollout ──────────────────────────────────────────────────────────────
 
 
-def compute_hand_delta_norm(actions: np.ndarray) -> np.ndarray:
-    """Per-step hand delta norm aligned to decision step t (predicting t+1)."""
+def rollout_ar(
+    policy: BCPolicy,
+    traj: dict,
+    action_mean: torch.Tensor,
+    action_std: torch.Tensor,
+    num_samples: int,
+    device: torch.device,
+    window_size: int = 8,
+) -> dict:
+    """AR rollout: both arm and hand predictions fed back to next step.
+
+    Returns dict with:
+        ar_runs:    (num_samples, T, 12)
+        no_corr:    (T, 12) deterministic no-correction baseline
+        delta_z:    (num_samples, T, latent_dim)
+        mu_prior:   (num_samples, T, latent_dim)
+        z_ctrl:     (num_samples, T, latent_dim)
+    """
+    T = traj["T"]
+    actions = traj["actions"].to(device)
+    main_imgs = traj["imgs_main"].to(device)
+    extra_imgs = traj["imgs_extra"].to(device)
+    action_mean_d = action_mean.to(device)
+    action_std_d = action_std.to(device)
+    latent_dim = int(policy.latent_dim)
+
+    policy.train()  # enable dropout if any
+
+    ar_runs = torch.zeros((num_samples, T, 12), device=device)
+    delta_z_all = torch.zeros((num_samples, T, latent_dim), device=device)
+    mu_prior_all = torch.zeros((num_samples, T, latent_dim), device=device)
+    z_ctrl_all = torch.zeros((num_samples, T, latent_dim), device=device)
+
+    with torch.no_grad():
+        for s in range(num_samples):
+            action_seq = actions.clone()
+
+            for t in range(T):
+                state = (action_seq[t:t + 1] - action_mean_d) / action_std_d
+                window = build_past_window(action_seq[:, 6:12], t, window_size).unsqueeze(0)
+                img_main = (main_imgs[t].float() / 255.0).unsqueeze(0)
+                img_extra = (extra_imgs[t].float() / 255.0).unsqueeze(0)
+
+                out = policy(
+                    img_main=img_main, img_extra=img_extra,
+                    state=state, past_hand_win=window,
+                )
+
+                ar_runs[s, t, :] = out["action_pred"][0]
+                delta_z_all[s, t, :] = out["delta_z"][0]
+                mu_prior_all[s, t, :] = out["mu_prior"][0]
+                z_ctrl_all[s, t, :] = out["z_ctrl"][0]
+
+                if t + 1 < T:
+                    action_seq[t + 1, :] = out["action_pred"][0]
+
+    # No-correction baseline (eval mode, delta_z=0)
+    policy.eval()
+    no_corr = torch.zeros((T, 12), device=device)
+    with torch.no_grad():
+        action_seq = actions.clone()
+        for t in range(T):
+            state = (action_seq[t:t + 1] - action_mean_d) / action_std_d
+            window = build_past_window(action_seq[:, 6:12], t, window_size).unsqueeze(0)
+            img_main = (main_imgs[t].float() / 255.0).unsqueeze(0)
+            img_extra = (extra_imgs[t].float() / 255.0).unsqueeze(0)
+            out = policy(
+                img_main=img_main, img_extra=img_extra,
+                state=state, past_hand_win=window, zero_delta=True,
+            )
+            no_corr[t, :] = out["action_pred"][0]
+            if t + 1 < T:
+                action_seq[t + 1, :] = out["action_pred"][0]
+
+    return {
+        "ar_runs": ar_runs.cpu().numpy(),
+        "no_corr": no_corr.cpu().numpy(),
+        "delta_z": delta_z_all.cpu().numpy(),
+        "mu_prior": mu_prior_all.cpu().numpy(),
+        "z_ctrl": z_ctrl_all.cpu().numpy(),
+    }
+
+
+# ─── Onset detection ─────────────────────────────────────────────────────────
+
+
+def detect_grasp_onset(actions, threshold=0.02, lookahead=3, min_count=2):
     if actions.shape[0] <= 1:
-        return np.zeros((actions.shape[0],), dtype=np.float32)
-    delta = actions[1:, 6:] - actions[:-1, 6:]
-    norm = np.linalg.norm(delta, axis=1).astype(np.float32)
-    return np.concatenate([norm, np.zeros((1,), dtype=np.float32)], axis=0)
-
-
-def detect_grasp_onset(
-    actions: np.ndarray,
-    threshold: float = 0.02,
-    lookahead: int = 3,
-    min_count: int = 2,
-) -> Optional[int]:
-    """Detect the first decision step where hand motion persistently increases."""
-    delta_norm = compute_hand_delta_norm(actions)
-    if delta_norm.shape[0] == 0:
         return None
-    last_valid = max(0, actions.shape[0] - 1)
-    for t in range(last_valid):
-        window = delta_norm[t:min(last_valid, t + lookahead)]
+    delta = actions[1:, 6:] - actions[:-1, 6:]
+    norm = np.linalg.norm(delta, axis=1)
+    delta_norm = np.concatenate([norm, np.zeros((1,))])
+    for t in range(actions.shape[0] - 1):
+        window = delta_norm[t:min(actions.shape[0] - 1, t + lookahead)]
         if int((window > threshold).sum()) >= min_count:
             return int(t)
     return None
 
 
-def build_slice_masks(
-    T: int,
-    onset_step: Optional[int],
-    onset_pre: int = 2,
-    onset_post: int = 4,
-) -> Dict[str, np.ndarray]:
-    masks = {name: np.zeros((T,), dtype=bool) for name in SLICE_NAMES}
-    if onset_step is None:
-        masks["pre_onset"][:] = True
-        return masks
-
-    band_start = max(0, onset_step - onset_pre)
-    band_end = min(T, onset_step + onset_post + 1)
-    masks["pre_onset"][:band_start] = True
-    masks["onset_band"][band_start:band_end] = True
-    masks["post_onset"][band_end:] = True
-    return masks
-
-
-def masked_mean(arr: np.ndarray, mask: np.ndarray) -> Optional[float]:
-    if not mask.any():
-        return None
-    return float(arr[mask].mean())
-
-
-# ─── Image / feedback plans ───────────────────────────────────────────────────
-
-
-def parse_feedback_horizon(value: str) -> Optional[int]:
-    if value == "full":
-        return None
-    horizon = int(value)
-    if horizon < 0:
-        raise ValueError("feedback_horizon must be >= 0 or 'full'")
-    return horizon
-
-
-def build_image_plan(
-    traj: dict,
-    image_mode: str,
-    seed: int,
-    swap_traj: Optional[dict] = None,
-) -> dict:
-    T = traj["T"]
-    if image_mode == "normal":
-        return {"source": "self", "indices": np.arange(T, dtype=np.int64)}
-    if image_mode == "stale":
-        return {"source": "self", "indices": np.zeros((T,), dtype=np.int64)}
-    if image_mode == "shuffle":
-        rng = np.random.default_rng(seed + int(traj["traj_id"]))
-        return {"source": "self", "indices": rng.permutation(T).astype(np.int64)}
-    if image_mode == "swap":
-        if swap_traj is None:
-            raise ValueError("image_mode='swap' requires a donor trajectory")
-        donor_idx = np.minimum(np.arange(T, dtype=np.int64), swap_traj["T"] - 1)
-        return {"source": swap_traj["traj_id"], "indices": donor_idx}
-    if image_mode == "zero":
-        return {"source": "zero", "indices": np.full((T,), -1, dtype=np.int64)}
-    raise ValueError(f"Unsupported image_mode={image_mode!r}")
-
-
-# ─── Rollout (batched over stochastic samples) ────────────────────────────────
-
-
-@torch.no_grad()
-def rollout_n_samples(
-    policy: BCPolicy,
-    traj: dict,
-    action_mean: torch.Tensor,
-    action_std: torch.Tensor,
-    mode: str,
-    num_samples: int,
-    device: torch.device,
-    window_size: int = 8,
-    image_mode: str = "normal",
-    feedback_horizon: Optional[int] = None,
-    state_mask: str = "all",
-    save_debug_latent: bool = False,
-    swap_traj: Optional[dict] = None,
-    seed: int = 42,
-) -> dict:
-    """Run BC over the full trajectory, batched over stochastic samples."""
-    T = traj["T"]
-    actions = traj["actions"].to(device)
-    main_imgs = traj["imgs_main"].to(device)
-    extra_imgs = traj["imgs_extra"].to(device)
-    swap_main = swap_extra = None
-    if swap_traj is not None:
-        swap_main = swap_traj["imgs_main"].to(device)
-        swap_extra = swap_traj["imgs_extra"].to(device)
-
-    action_mean_d = action_mean.to(device)
-    action_std_d = action_std.to(device)
-    image_plan = build_image_plan(traj, image_mode, seed, swap_traj=swap_traj)
-
-    action_seqs = actions.unsqueeze(0).expand(num_samples, -1, -1).clone()
-    zero_delta = (mode == "no_corr")
-    replace = (mode == "ar")
-
-    runs = torch.zeros((num_samples, T, 12), device=device)
-    debug = None
-    if save_debug_latent:
-        latent_dim = int(policy.latent_dim)
-        debug = {
-            "delta_z": torch.zeros((num_samples, T, latent_dim), device=device),
-            "mu_prior": torch.zeros((num_samples, T, latent_dim), device=device),
-            "log_var_prior": torch.zeros((num_samples, T, latent_dim), device=device),
-            "z_ctrl": torch.zeros((num_samples, T, latent_dim), device=device),
-            "z_no_corr": torch.zeros((num_samples, T, latent_dim), device=device),
-            "hand_action": torch.zeros((num_samples, T, 6), device=device),
-            "hand_no_corr": torch.zeros((num_samples, T, 6), device=device),
-        }
-
-    for t in range(T):
-        state = (action_seqs[:, t, :] - action_mean_d) / action_std_d
-        state = apply_state_mask(state, state_mask)
-
-        windows = torch.stack(
-            [build_past_window(action_seqs[s, :, 6:12], t, window_size) for s in range(num_samples)],
-            dim=0,
-        )
-
-        if image_mode == "zero":
-            shape = (num_samples,) + tuple(main_imgs.shape[1:])
-            img_main = torch.zeros(shape, device=device, dtype=torch.float32)
-            img_extra = torch.zeros(shape, device=device, dtype=torch.float32)
-        else:
-            img_idx = int(image_plan["indices"][t])
-            if image_mode == "swap":
-                src_main = swap_main
-                src_extra = swap_extra
-            else:
-                src_main = main_imgs
-                src_extra = extra_imgs
-            img_main = (src_main[img_idx].float() / 255.0).unsqueeze(0).repeat(num_samples, 1, 1, 1)
-            img_extra = (src_extra[img_idx].float() / 255.0).unsqueeze(0).repeat(num_samples, 1, 1, 1)
-
-        out = policy(
-            img_main=img_main,
-            img_extra=img_extra,
-            state=state,
-            past_hand_win=windows,
-            zero_delta=zero_delta,
-        )
-        runs[:, t, :6] = out["arm_action"]
-        runs[:, t, 6:] = out["hand_action"]
-
-        if debug is not None:
-            for key in [
-                "delta_z", "mu_prior", "log_var_prior", "z_ctrl", "z_no_corr",
-            ]:
-                debug[key][:, t, :] = out[key]
-            debug["hand_action"][:, t, :] = out["hand_action"]
-            debug["hand_no_corr"][:, t, :] = out["hand_no_corr"]
-
-        if replace and t + 1 < T and (feedback_horizon is None or t < feedback_horizon):
-            action_seqs[:, t + 1, :6] = out["arm_action"]
-            action_seqs[:, t + 1, 6:] = out["hand_action"]
-
-    payload = {
-        "runs": runs.cpu().numpy(),
-        "image_indices": image_plan["indices"],
-        "image_source": image_plan["source"],
-    }
-    if debug is not None:
-        payload["debug"] = {k: v.cpu().numpy() for k, v in debug.items()}
-    return payload
-
-
-# ─── Per-trajectory eval ──────────────────────────────────────────────────────
-
-
-def eval_trajectory(
-    policy: BCPolicy,
-    traj: dict,
-    action_mean: torch.Tensor,
-    action_std: torch.Tensor,
-    num_samples: int,
-    device: torch.device,
-    window_size: int = 8,
-    verbose: bool = True,
-    image_mode: str = "normal",
-    feedback_horizon: Optional[int] = None,
-    state_mask: str = "all",
-    save_debug_latent: bool = False,
-    swap_traj: Optional[dict] = None,
-    seed: int = 42,
-    onset_threshold: float = 0.02,
-    onset_lookahead: int = 3,
-    onset_min_count: int = 2,
-) -> dict:
-    gt = traj["actions"].numpy()
-    T = traj["T"]
-    traj_id = traj["traj_id"]
-
-    gt_target = np.concatenate([gt[1:], gt[-1:]], axis=0)
-    copy_arm = ((gt[:, :6] - gt_target[:, :6]) ** 2).mean(axis=1)
-    copy_hand = ((gt[:, 6:] - gt_target[:, 6:]) ** 2).mean(axis=1)
-
-    onset_step = detect_grasp_onset(
-        gt,
-        threshold=onset_threshold,
-        lookahead=onset_lookahead,
-        min_count=onset_min_count,
-    )
-    hand_delta_norm = compute_hand_delta_norm(gt)
-    slice_masks = build_slice_masks(T, onset_step)
-
-    result = {
-        "traj_id": traj_id,
-        "T": T,
-        "gt": gt,
-        "gt_target": gt_target,
-        "num_samples": num_samples,
-        "copy_arm_mse": copy_arm,
-        "copy_hand_mse": copy_hand,
-        "copy_arm_mean": float(copy_arm.mean()),
-        "copy_hand_mean": float(copy_hand.mean()),
-        "hand_delta_norm": hand_delta_norm,
-        "onset_step": int(onset_step) if onset_step is not None else None,
-        "onset_found": onset_step is not None,
-        "image_mode": image_mode,
-        "feedback_horizon": "full" if feedback_horizon is None else int(feedback_horizon),
-        "state_mask": state_mask,
-        "pre_onset_mask": slice_masks["pre_onset"].astype(np.uint8),
-        "onset_band_mask": slice_masks["onset_band"].astype(np.uint8),
-        "post_onset_mask": slice_masks["post_onset"].astype(np.uint8),
-        "slices": {},
-    }
-
-    for slice_name, mask in slice_masks.items():
-        result["slices"][slice_name] = {
-            "n_steps": int(mask.sum()),
-            "copy_arm_mse": masked_mean(copy_arm, mask),
-            "copy_hand_mse": masked_mean(copy_hand, mask),
-            "modes": {},
-        }
-
-    for mode in MODES:
-        rollout = rollout_n_samples(
-            policy=policy,
-            traj=traj,
-            action_mean=action_mean,
-            action_std=action_std,
-            mode=mode,
-            num_samples=num_samples,
-            device=device,
-            window_size=window_size,
-            image_mode=image_mode,
-            feedback_horizon=feedback_horizon,
-            state_mask=state_mask,
-            save_debug_latent=save_debug_latent,
-            swap_traj=swap_traj,
-            seed=seed,
-        )
-        runs = rollout["runs"]
-        mean = runs.mean(axis=0)
-        std = runs.std(axis=0)
-        per_step_arm = ((runs[:, :, :6] - gt_target[:, :6]) ** 2).mean(axis=2).mean(axis=0)
-        per_step_hand = ((runs[:, :, 6:] - gt_target[:, 6:]) ** 2).mean(axis=2).mean(axis=0)
-
-        result[f"{mode}_runs"] = runs
-        result[f"{mode}_mean"] = mean
-        result[f"{mode}_std"] = std
-        result[f"{mode}_mse_arm"] = per_step_arm
-        result[f"{mode}_mse_hand"] = per_step_hand
-        result[f"{mode}_mse_arm_mean"] = float(per_step_arm.mean())
-        result[f"{mode}_mse_hand_mean"] = float(per_step_hand.mean())
-        result[f"{mode}_image_indices"] = rollout["image_indices"]
-        result[f"{mode}_image_source"] = rollout["image_source"]
-
-        if save_debug_latent:
-            for key, value in rollout["debug"].items():
-                result[f"{mode}_{key}"] = value
-
-        for slice_name, mask in slice_masks.items():
-            result["slices"][slice_name]["modes"][mode] = {
-                "arm_mse": masked_mean(per_step_arm, mask),
-                "hand_mse": masked_mean(per_step_hand, mask),
-            }
-
-    if verbose:
-        print(f"\nTrajectory {traj_id}: {T} steps  onset={result['onset_step']}")
-        print(f"  image_mode={image_mode}  feedback_horizon={result['feedback_horizon']}  state_mask={state_mask}")
-        print(f"  {'mode':<28} | {'arm_mse':>10} | {'hand_mse':>10}")
-        print(f"  {'-' * 28} | {'-' * 10} | {'-' * 10}")
-        print(
-            f"  {'Copy baseline (a[t+1]=a[t])':<28} | "
-            f"{result['copy_arm_mean']:>10.6f} | {result['copy_hand_mean']:>10.6f}"
-        )
-        for mode in MODES:
-            print(
-                f"  {MODE_LABELS[mode]:<28} | "
-                f"{result[f'{mode}_mse_arm_mean']:>10.6f} | "
-                f"{result[f'{mode}_mse_hand_mean']:>10.6f}"
-            )
-        for slice_name in SLICE_NAMES:
-            n_steps = result["slices"][slice_name]["n_steps"]
-            tf_hand = result["slices"][slice_name]["modes"]["tf"]["hand_mse"]
-            no_corr_hand = result["slices"][slice_name]["modes"]["no_corr"]["hand_mse"]
-            print(
-                f"  slice={slice_name:<10} n={n_steps:<3d}  "
-                f"tf_hand={tf_hand if tf_hand is not None else float('nan'):.6f}  "
-                f"no_corr_hand={no_corr_hand if no_corr_hand is not None else float('nan'):.6f}"
-            )
-
-    return result
-
-
-# ─── Summary aggregation ──────────────────────────────────────────────────────
-
-
-def summarize_results(
-    all_results: List[dict],
-    ckpt_path: str,
-    test_dir: str,
-    image_mode: str,
-    feedback_horizon: Optional[int],
-    state_mask: str,
-    num_samples: int,
-) -> dict:
-    summary = {
-        "ckpt": ckpt_path,
-        "test_dir": test_dir,
-        "num_trajectories": len(all_results),
-        "num_samples_per_mode": num_samples,
-        "image_mode": image_mode,
-        "feedback_horizon": "full" if feedback_horizon is None else int(feedback_horizon),
-        "state_mask": state_mask,
-        "modes": {},
-        "copy_baseline": {},
-        "slices": {},
-        "per_trajectory": [],
-    }
-
-    copy_arm_agg = float(np.mean([r["copy_arm_mean"] for r in all_results]))
-    copy_hand_agg = float(np.mean([r["copy_hand_mean"] for r in all_results]))
-    summary["copy_baseline"] = {"arm_mse": copy_arm_agg, "hand_mse": copy_hand_agg}
-
-    for mode in MODES:
-        arm = float(np.mean([r[f"{mode}_mse_arm_mean"] for r in all_results]))
-        hand = float(np.mean([r[f"{mode}_mse_hand_mean"] for r in all_results]))
-        summary["modes"][mode] = {"arm_mse": arm, "hand_mse": hand}
-
-    onset_steps = [r["onset_step"] for r in all_results if r["onset_step"] is not None]
-    summary["onset_stats"] = {
-        "found": len(onset_steps),
-        "missing": len(all_results) - len(onset_steps),
-        "mean_step": float(np.mean(onset_steps)) if onset_steps else None,
-        "median_step": float(np.median(onset_steps)) if onset_steps else None,
-    }
-
-    for slice_name in SLICE_NAMES:
-        count = int(sum(r["slices"][slice_name]["n_steps"] for r in all_results))
-        slice_entry = {
-            "num_steps": count,
-            "copy_baseline": {"arm_mse": None, "hand_mse": None},
-            "modes": {},
-            "vision_gain_arm": None,
-            "vision_gain_hand": None,
-        }
-        if count > 0:
-            copy_arm = sum(
-                r["slices"][slice_name]["copy_arm_mse"] * r["slices"][slice_name]["n_steps"]
-                for r in all_results
-                if r["slices"][slice_name]["copy_arm_mse"] is not None
-            ) / count
-            copy_hand = sum(
-                r["slices"][slice_name]["copy_hand_mse"] * r["slices"][slice_name]["n_steps"]
-                for r in all_results
-                if r["slices"][slice_name]["copy_hand_mse"] is not None
-            ) / count
-            slice_entry["copy_baseline"] = {
-                "arm_mse": float(copy_arm),
-                "hand_mse": float(copy_hand),
-            }
-            for mode in MODES:
-                arm = sum(
-                    r["slices"][slice_name]["modes"][mode]["arm_mse"] * r["slices"][slice_name]["n_steps"]
-                    for r in all_results
-                    if r["slices"][slice_name]["modes"][mode]["arm_mse"] is not None
-                ) / count
-                hand = sum(
-                    r["slices"][slice_name]["modes"][mode]["hand_mse"] * r["slices"][slice_name]["n_steps"]
-                    for r in all_results
-                    if r["slices"][slice_name]["modes"][mode]["hand_mse"] is not None
-                ) / count
-                slice_entry["modes"][mode] = {"arm_mse": float(arm), "hand_mse": float(hand)}
-            slice_entry["vision_gain_arm"] = (
-                slice_entry["modes"]["no_corr"]["arm_mse"] - slice_entry["modes"]["tf"]["arm_mse"]
-            )
-            slice_entry["vision_gain_hand"] = (
-                slice_entry["modes"]["no_corr"]["hand_mse"] - slice_entry["modes"]["tf"]["hand_mse"]
-            )
-        summary["slices"][slice_name] = slice_entry
-
-    vg_arm = summary["modes"]["no_corr"]["arm_mse"] - summary["modes"]["tf"]["arm_mse"]
-    vg_hand = summary["modes"]["no_corr"]["hand_mse"] - summary["modes"]["tf"]["hand_mse"]
-    ar_drift_arm = summary["modes"]["ar"]["arm_mse"] - summary["modes"]["tf"]["arm_mse"]
-    ar_drift_hand = summary["modes"]["ar"]["hand_mse"] - summary["modes"]["tf"]["hand_mse"]
-    summary["vision_gain_arm"] = vg_arm
-    summary["vision_gain_hand"] = vg_hand
-    summary["ar_drift_arm"] = ar_drift_arm
-    summary["ar_drift_hand"] = ar_drift_hand
-
-    for r in all_results:
-        summary["per_trajectory"].append({
-            "traj_id": r["traj_id"],
-            "T": r["T"],
-            "onset_step": r["onset_step"],
-            "copy_arm": r["copy_arm_mean"],
-            "copy_hand": r["copy_hand_mean"],
-            **{f"{m}_arm": r[f"{m}_mse_arm_mean"] for m in MODES},
-            **{f"{m}_hand": r[f"{m}_mse_hand_mean"] for m in MODES},
-            "slices": r["slices"],
-        })
-
-    return summary
-
-
 # ─── Plotting ─────────────────────────────────────────────────────────────────
 
 
-def plot_trajectory_actions(result, output_dir):
-    """12 subplots (4 rows × 3 cols): GT vs each mode (mean + std band)."""
+def plot_trajectory_actions(traj_id, T, gt_target, ar_runs, no_corr,
+                            num_samples, output_dir, onset_step=None):
+    """4x3 grid: 12 joints with GT / AR samples / mean / std / no-corr."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    gt_target = result["gt_target"]
-    T = result["T"]
-    traj_id = result["traj_id"]
-    n = result["num_samples"]
+    ar_mean = ar_runs.mean(axis=0)
+    ar_std = ar_runs.std(axis=0)
+    steps = np.arange(T)
 
-    fig, axes = plt.subplots(4, 3, figsize=(18, 14), sharex=True)
+    fig, axes = plt.subplots(4, 3, figsize=(18, 16), sharex=True)
     fig.suptitle(
-        f"Trajectory {traj_id}: GT next-pose vs BC predictions  (T={T}, n_samples={n})",
+        f"Trajectory {traj_id}:  AR rollout  (T={T}, n={num_samples})",
         fontsize=14,
     )
 
     for i, name in enumerate(JOINT_NAMES):
         ax = axes.flat[i]
-        ax.plot(range(T), gt_target[:, i], "k-", label="GT next pose", linewidth=2.0, zorder=10)
-        for mode in MODES:
-            mean = result[f"{mode}_mean"][:, i]
-            std = result[f"{mode}_std"][:, i]
-            ax.plot(range(T), mean, color=MODE_COLORS[mode], label=MODE_LABELS[mode], linewidth=1.3)
-            if n > 1:
-                ax.fill_between(range(T), mean - std, mean + std, color=MODE_COLORS[mode], alpha=0.15, linewidth=0)
+        for s in range(num_samples):
+            ax.plot(steps, ar_runs[s, :, i],
+                    color="steelblue", alpha=0.25, linewidth=0.8)
+        ax.plot(steps, ar_mean[:, i],
+                color="royalblue", linewidth=2.0,
+                label=f"AR mean (n={num_samples})")
+        ax.fill_between(steps,
+                         ar_mean[:, i] - ar_std[:, i],
+                         ar_mean[:, i] + ar_std[:, i],
+                         color="steelblue", alpha=0.15)
+        ax.plot(steps, gt_target[:, i],
+                "k-", linewidth=2.0, label="GT next-pose", zorder=10)
+        ax.plot(steps, no_corr[:, i],
+                color="gray", linestyle="--", linewidth=1.2, alpha=0.7,
+                label="No correction (VAE prior)")
+        if onset_step is not None:
+            ax.axvline(onset_step, color="red", linestyle=":", linewidth=1.0, alpha=0.6)
         ax.set_ylabel(name, fontsize=10)
         ax.grid(True, alpha=0.3)
         if i == 0:
             ax.legend(fontsize=7, loc="best")
 
     for ax in axes[-1, :]:
-        ax.set_xlabel("Decision step t  (BC predicts action[t+1])")
+        ax.set_xlabel("Decision step t", fontsize=10)
 
     fig.tight_layout()
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"traj_{traj_id}_actions.png")
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    path = os.path.join(output_dir, f"traj_{traj_id}_ar_actions.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Plot saved: {path}")
 
 
-def plot_trajectory_mse(result, output_dir):
-    """Per-step MSE for arm and hand, all 3 modes side by side."""
+def plot_trajectory_mse(traj_id, T, gt_target, ar_runs, no_corr,
+                        output_dir, onset_step=None):
+    """Per-step MSE: arm and hand side-by-side."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    T = result["T"]
-    traj_id = result["traj_id"]
+    ar_arm_mse = ((ar_runs[:, :, :6] - gt_target[:, :6]) ** 2).mean(axis=2).mean(axis=0)
+    ar_hand_mse = ((ar_runs[:, :, 6:] - gt_target[:, 6:]) ** 2).mean(axis=2).mean(axis=0)
+    nc_arm_mse = ((no_corr[:, :6] - gt_target[:, :6]) ** 2).mean(axis=1)
+    nc_hand_mse = ((no_corr[:, 6:] - gt_target[:, 6:]) ** 2).mean(axis=1)
+    copy_arm = np.concatenate([((gt_target[:-1, :6] - gt_target[1:, :6]) ** 2).mean(axis=1),
+                                np.zeros(1)])
+    copy_hand = np.concatenate([((gt_target[:-1, 6:] - gt_target[1:, 6:]) ** 2).mean(axis=1),
+                                 np.zeros(1)])
+    steps = np.arange(T)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(f"Trajectory {traj_id}: per-step MSE", fontsize=14)
+    fig.suptitle(f"Trajectory {traj_id}: Per-step MSE", fontsize=13)
 
-    for ax, side, title in [
-        (axes[0], "arm", "Arm (dims 0–5)"),
-        (axes[1], "hand", "Hand (dims 6–11)"),
+    for ax, side, ar_mse, nc_mse, cp_mse in [
+        (axes[0], "Arm", ar_arm_mse, nc_arm_mse, copy_arm),
+        (axes[1], "Hand", ar_hand_mse, nc_hand_mse, copy_hand),
     ]:
-        for mode in MODES:
-            mse = result[f"{mode}_mse_{side}"]
-            mean = float(mse.mean())
-            ax.plot(
-                range(T), mse, color=MODE_COLORS[mode],
-                label=f"{MODE_LABELS[mode]} (mean={mean:.5f})",
-                linewidth=1.5, alpha=0.85,
-            )
-        copy_mse = result[f"copy_{side}_mse"]
-        ax.plot(
-            range(T), copy_mse, "k--",
-            label=f"Copy baseline (mean={float(copy_mse.mean()):.5f})",
-            linewidth=1.0, alpha=0.6,
-        )
-        onset_step = result.get("onset_step")
+        ax.plot(steps, ar_mse, color="royalblue", linewidth=1.5,
+                label=f"AR (mean={ar_mse.mean():.5f})")
+        ax.plot(steps, nc_mse, color="gray", linestyle="--", linewidth=1.2,
+                label=f"No-corr (mean={nc_mse.mean():.5f})")
+        ax.plot(steps, cp_mse, "k:", linewidth=1.0, alpha=0.5,
+                label=f"Copy baseline (mean={cp_mse.mean():.5f})")
         if onset_step is not None:
-            ax.axvline(onset_step, color="gray", linestyle=":", linewidth=1.0, alpha=0.8)
+            ax.axvline(onset_step, color="red", linestyle=":", linewidth=1.0, alpha=0.6)
         ax.set_xlabel("Decision step t")
         ax.set_ylabel("MSE")
-        ax.set_title(title)
+        ax.set_title(f"{side} MSE")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="best")
 
     fig.tight_layout()
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"traj_{traj_id}_mse.png")
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    path = os.path.join(output_dir, f"traj_{traj_id}_ar_mse.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Plot saved: {path}")
 
 
-def plot_summary(all_results, output_dir):
-    """Bar chart: mean arm/hand MSE per mode across all evaluated trajectories."""
+def plot_summary(all_results, output_dir, num_samples):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    arm = {m: float(np.mean([r[f"{m}_mse_arm_mean"] for r in all_results])) for m in MODES}
-    hand = {m: float(np.mean([r[f"{m}_mse_hand_mean"] for r in all_results])) for m in MODES}
-
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f"BC eval summary across {len(all_results)} trajectories", fontsize=13)
-
-    for ax, side, vals in [(axes[0], "arm", arm), (axes[1], "hand", hand)]:
-        labels = [MODE_LABELS[m] for m in MODES]
-        values = [vals[m] for m in MODES]
-        colors = [MODE_COLORS[m] for m in MODES]
-        bars = ax.bar(labels, values, color=colors)
+    fig.suptitle(
+        f"BC AR Evaluation Summary  ({len(all_results)} trajectories, n={num_samples})",
+        fontsize=13,
+    )
+    for ax, side in [(axes[0], "arm"), (axes[1], "hand")]:
+        ar_v = np.mean([r[f"ar_{side}_mse"] for r in all_results])
+        nc_v = np.mean([r[f"nc_{side}_mse"] for r in all_results])
+        cp_v = np.mean([r[f"copy_{side}_mse"] for r in all_results])
+        labels = ["AR", "No Correction", "Copy Baseline"]
+        values = [ar_v, nc_v, cp_v]
+        colors = ["royalblue", "gray", "black"]
+        bars = ax.bar(labels, values, color=colors, alpha=0.8)
         for b, v in zip(bars, values):
-            ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.5f}", ha="center", va="bottom", fontsize=9)
+            ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.5f}",
+                    ha="center", va="bottom", fontsize=9)
         ax.set_ylabel("Mean MSE")
-        ax.set_title(f"{side} MSE")
-        ax.set_ylim(0, max(values) * 1.25 if max(values) > 0 else 1.0)
-        ax.tick_params(axis="x", labelrotation=15)
+        ax.set_title(f"{side.title()} MSE")
+        ax.set_ylim(0, max(values) * 1.3 if max(values) > 0 else 1.0)
         ax.grid(True, alpha=0.3, axis="y")
 
     fig.tight_layout()
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "summary.png")
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    path = os.path.join(output_dir, "summary_ar.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"\nSummary plot saved: {path}")
+    print(f"\nSummary plot: {path}")
 
 
-# ─── Policy loading / selection helpers ───────────────────────────────────────
+def plot_per_trajectory_bar(all_results, output_dir):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    sorted_results = sorted(all_results, key=lambda r: r["ar_hand_mse"])
+    traj_ids = [r["traj_id"] for r in sorted_results]
+    ar_hand = [r["ar_hand_mse"] for r in sorted_results]
+    nc_hand = [r["nc_hand_mse"] for r in sorted_results]
+
+    fig, ax = plt.subplots(1, 1, figsize=(max(12, len(traj_ids) * 0.5), 5))
+    x = np.arange(len(traj_ids))
+    w = 0.35
+    ax.bar(x - w / 2, ar_hand, w, color="royalblue", alpha=0.8, label="AR hand")
+    ax.bar(x + w / 2, nc_hand, w, color="gray", alpha=0.6, label="No-corr hand")
+    ax.set_xticks(x)
+    ax.set_xticklabels(traj_ids, rotation=60, ha="right", fontsize=7)
+    ax.set_ylabel("Hand MSE")
+    ax.set_title("Per-trajectory AR hand MSE (sorted)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    path = os.path.join(output_dir, "per_trajectory_hand_mse.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Per-trajectory bar: {path}")
 
 
-def load_policy_from_checkpoint(
-    ckpt_path: str,
-    device: torch.device,
-    vae_ckpt_override: Optional[str] = None,
-):
-    print(f"Loading BC checkpoint: {ckpt_path}")
-    bc_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    action_mean = bc_ckpt["action_mean"]
-    action_std = bc_ckpt["action_std"]
-    bc_args = bc_ckpt.get("args", {})
+def plot_latent_diagnostics(all_results, output_dir, num_samples):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    vae_ckpt_path = (
-        vae_ckpt_override
-        or bc_args.get("vae_ckpt")
-        or os.path.join(_PROJ_ROOT, "outputs/dim_2_best/checkpoint.pth")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(
+        f"Latent Diagnostics  ({len(all_results)} trajectories, n={num_samples})",
+        fontsize=13,
     )
-    vae = build_and_freeze_vae(vae_ckpt_path)
 
-    policy = BCPolicy(
-        vae=vae,
-        state_dim=12,
-        arm_state_dim=bc_args.get("arm_state_dim", 6),
-        feat_dim=bc_args.get("feat_dim", 128),
-        fusion_dim=bc_args.get("fusion_dim", 256),
-        disable_vision=bc_args.get("disable_vision", False),
-        dropout=bc_args.get("dropout", 0.0),
-        hand_condition_on_arm=bc_args.get("hand_condition_on_arm", False),
-    ).to(device)
-    missing, unexpected = policy.load_state_dict(bc_ckpt["model"], strict=False)
-    bc_only_missing = [k for k in missing if not k.startswith("vae.")]
-    if bc_only_missing or unexpected:
-        legacy_hint = any(
-            key.startswith("delta_mu_head") or key.startswith("delta_log_var_head")
-            for key in unexpected
-        )
-        msg = (
-            "BC checkpoint is incompatible with the current BC 3.0 weakly-coupled policy. "
-            f"missing={bc_only_missing}, unexpected={unexpected}."
-        )
-        if legacy_hint:
-            msg += " This looks like an older delta_mu/delta_log_var checkpoint; retrain BC with the new architecture before evaluation."
-        raise RuntimeError(msg)
-    policy.eval()
-    print(f"Loaded BC weights at step {bc_ckpt.get('step', '?')}")
-    return policy, action_mean, action_std, bc_args, bc_ckpt
+    all_dz_norm, all_mu_norm, all_dz_d0, all_dz_d1 = [], [], [], []
+    for r in all_results:
+        dz, mu = r["delta_z"], r["mu_prior"]
+        all_dz_norm.extend(np.linalg.norm(dz, axis=-1).flatten().tolist())
+        all_mu_norm.extend(np.linalg.norm(mu, axis=-1).flatten().tolist())
+        all_dz_d0.extend(dz[:, :, 0].flatten().tolist())
+        if dz.shape[-1] > 1:
+            all_dz_d1.extend(dz[:, :, 1].flatten().tolist())
 
+    ax = axes[0, 0]
+    ax.hist(all_dz_norm, bins=80, color="steelblue", alpha=0.7, density=True)
+    ax.axvline(np.mean(all_dz_norm), color="red", linestyle="--", linewidth=1.5,
+               label=f"mean={np.mean(all_dz_norm):.4f}")
+    ax.set_xlabel("|delta_z|"); ax.set_title("delta_z magnitude")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
-def select_trajectory_files(test_dir: str, traj_ids: Optional[List[int]], use_all: bool) -> List[str]:
-    all_files = sorted(glob.glob(os.path.join(test_dir, "trajectory_*_demo_expert.pt")))
-    if traj_ids:
-        files = []
-        for tid in traj_ids:
-            matches = [f for f in all_files if f"trajectory_{tid}_" in f]
-            if not matches:
-                print(f"  WARNING: trajectory {tid} not found in {test_dir}")
-            files.extend(matches)
-        return files
-    if use_all:
-        return all_files
-    return all_files[:3]
+    ax = axes[0, 1]
+    ax.hist(all_mu_norm, bins=80, color="gray", alpha=0.7, density=True)
+    ax.axvline(np.mean(all_mu_norm), color="red", linestyle="--", linewidth=1.5,
+               label=f"mean={np.mean(all_mu_norm):.4f}")
+    ax.set_xlabel("|mu_prior|"); ax.set_title("mu_prior magnitude")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 0]
+    if all_dz_d1:
+        ax.scatter(all_dz_d0[:5000], all_dz_d1[:5000], s=2, alpha=0.3, color="steelblue")
+        ax.set_xlabel("delta_z[0]"); ax.set_ylabel("delta_z[1]")
+        ax.set_title("delta_z scatter (first 5k)")
+    else:
+        ax.hist(all_dz_d0, bins=80, color="steelblue", alpha=0.7)
+        ax.set_xlabel("delta_z[0]"); ax.set_title("delta_z[0] distribution")
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    max_T = max(r["T"] for r in all_results)
+    dz_by_t = [[] for _ in range(max_T)]
+    for r in all_results:
+        norms = np.linalg.norm(r["delta_z"], axis=-1)
+        for t in range(r["T"]):
+            dz_by_t[t].extend(norms[:, t].tolist())
+    mean_t = [np.mean(v) if v else 0 for v in dz_by_t]
+    std_t = [np.std(v) if v else 0 for v in dz_by_t]
+    ax.plot(mean_t, color="royalblue", linewidth=1.5, label="mean |delta_z|")
+    ax.fill_between(range(len(mean_t)),
+                     np.array(mean_t) - np.array(std_t),
+                     np.array(mean_t) + np.array(std_t),
+                     color="steelblue", alpha=0.2)
+    ax.set_xlabel("Decision step t"); ax.set_ylabel("|delta_z|")
+    ax.set_title("delta_z magnitude over time")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "latent_diagnostics.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Latent diagnostics: {path}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate BC policy over frozen VAE")
-    parser.add_argument(
-        "--ckpt", type=str,
-        default=os.path.join(_PROJ_ROOT, "outputs/bc_simple_v2/checkpoint.pth"),
-        help="BC checkpoint path",
-    )
-    parser.add_argument(
-        "--vae_ckpt", type=str, default=None,
-        help="VAE checkpoint (default: read from BC ckpt's args)",
-    )
-    parser.add_argument(
-        "--test_dir", type=str,
-        default=os.path.join(_PROJ_ROOT, "data/20260327-11:10:43/demos/success/test"),
-    )
-    parser.add_argument(
-        "--output_dir", type=str,
-        default=os.path.join(_PROJ_ROOT, "visualizations/bc_eval/v2"),
-    )
-    parser.add_argument("--window_size", type=int, default=8)
-    parser.add_argument(
-        "--traj_id", type=int, nargs="+", default=None,
-        help="Specific trajectory IDs (default: first 3 in test_dir)",
-    )
-    parser.add_argument("--all", action="store_true", help="Evaluate all test trajectories")
-    parser.add_argument(
-        "--num_samples", type=int, default=5,
-        help="Repeated rollout copies per mode; current hand path is deterministic",
-    )
-    parser.add_argument("--image_mode", type=str, default="normal", choices=IMAGE_MODES)
-    parser.add_argument(
-        "--feedback_horizon", type=str, default="full",
-        help="AR feedback horizon: full or an integer K. Only the first K predictions are fed back.",
-    )
-    parser.add_argument("--save_debug_latent", action="store_true")
-    parser.add_argument(
-        "--state_mask", type=str, default=None,
-        help="Override the state-mask ablation. Default: read from checkpoint args.",
-    )
-    parser.add_argument("--onset_threshold", type=float, default=0.02)
-    parser.add_argument("--onset_lookahead", type=int, default=3)
-    parser.add_argument("--onset_min_count", type=int, default=2)
-    parser.add_argument("--no_plot", action="store_true", help="Skip plots (save raw .npz only)")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--device", type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-    )
+    parser = argparse.ArgumentParser(description="BC 3.0 AR evaluation")
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--test_dir", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--num_samples", type=int, default=5)
+    parser.add_argument("--vae_ckpt", type=str, default=None)
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    policy, action_mean, action_std, bc_args, _ = load_policy_from_checkpoint(
-        args.ckpt, device=device, vae_ckpt_override=args.vae_ckpt,
+    # ── Load checkpoint ──
+    print(f"Loading: {args.ckpt}")
+    bc_ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    action_mean = bc_ckpt["action_mean"]
+    action_std = bc_ckpt["action_std"]
+    bc_args = bc_ckpt.get("args", {})
+
+    vae_path = (
+        args.vae_ckpt
+        or bc_args.get("vae_ckpt")
+        or os.path.join(_PROJ_ROOT, "outputs/dim_2_best/checkpoint.pth")
     )
-    state_mask = args.state_mask or bc_args.get("state_mask", "all")
-    if state_mask not in ["all", "arm_only", "none"]:
-        raise ValueError(f"Unsupported state_mask={state_mask!r}")
-    feedback_horizon = parse_feedback_horizon(args.feedback_horizon)
-
-    files = select_trajectory_files(args.test_dir, args.traj_id, args.all)
-    if not files:
-        print("No trajectory files found!")
-        return
-
-    loaded = [load_trajectory_full(f) for f in files]
-    if args.image_mode == "swap" and len(loaded) < 2:
-        raise ValueError("image_mode='swap' requires at least two trajectories")
-
-    print(
-        f"Evaluating {len(files)} trajectories with {args.num_samples} samples per mode  "
-        f"(image_mode={args.image_mode}, feedback_horizon={args.feedback_horizon}, state_mask={state_mask})"
-    )
-
-    all_results = []
-    for idx, traj in enumerate(loaded):
-        swap_traj = None
-        if args.image_mode == "swap":
-            swap_traj = loaded[(idx + 1) % len(loaded)]
-        result = eval_trajectory(
-            policy=policy,
-            traj=traj,
-            action_mean=action_mean,
-            action_std=action_std,
-            num_samples=args.num_samples,
-            device=device,
-            window_size=args.window_size,
-            verbose=True,
-            image_mode=args.image_mode,
-            feedback_horizon=feedback_horizon,
-            state_mask=state_mask,
-            save_debug_latent=args.save_debug_latent,
-            swap_traj=swap_traj,
-            seed=args.seed,
-            onset_threshold=args.onset_threshold,
-            onset_lookahead=args.onset_lookahead,
-            onset_min_count=args.onset_min_count,
+    vae = build_and_freeze_vae(vae_path)
+    policy = BCPolicy(
+        vae=vae,
+        arm_state_dim=bc_args.get("arm_state_dim", 6),
+        feat_dim=bc_args.get("feat_dim", 128),
+        fusion_dim=bc_args.get("fusion_dim", 256),
+        dropout=bc_args.get("dropout", 0.0),
+    ).to(device)
+    missing, unexpected = policy.load_state_dict(bc_ckpt["model"], strict=False)
+    bc_only_missing = [k for k in missing if not k.startswith("vae.")]
+    if bc_only_missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint incompatible: missing={bc_only_missing}, unexpected={unexpected}"
         )
+
+    dropout_rate = bc_args.get("dropout", 0.0)
+    print(f"Loaded step {bc_ckpt.get('step', '?')}, dropout={dropout_rate}")
+    if dropout_rate == 0:
+        print("WARNING: dropout=0 — all samples will be identical.")
+
+    # ── Load test trajectories ──
+    test_dir = args.test_dir or bc_args.get("test_dir")
+    if test_dir is None:
+        test_dir = os.path.join(_PROJ_ROOT, "data/20260327-11:10:43/demos/success/test")
+    files = sorted(glob.glob(os.path.join(test_dir, "trajectory_*_demo_expert.pt")))
+    print(f"Found {len(files)} test trajectories in {test_dir}")
+
+    # ── Evaluate each trajectory ──
+    all_results = []
+    for fi, f in enumerate(files):
+        traj = load_trajectory(f)
+        traj_id = traj["traj_id"]
+        T = traj["T"]
+        gt = traj["actions"].numpy()
+        gt_target = np.concatenate([gt[1:], gt[-1:]], axis=0)
+
+        print(f"\n[{fi + 1}/{len(files)}] Trajectory {traj_id} (T={T})")
+
+        rollout = rollout_ar(
+            policy=policy, traj=traj,
+            action_mean=action_mean, action_std=action_std,
+            num_samples=args.num_samples, device=device,
+        )
+
+        ar_runs = rollout["ar_runs"]
+        no_corr = rollout["no_corr"]
+
+        ar_arm_mse = float(((ar_runs[:, :, :6] - gt_target[:, :6]) ** 2).mean())
+        ar_hand_mse = float(((ar_runs[:, :, 6:] - gt_target[:, 6:]) ** 2).mean())
+        nc_arm_mse = float(((no_corr[:, :6] - gt_target[:, :6]) ** 2).mean())
+        nc_hand_mse = float(((no_corr[:, 6:] - gt_target[:, 6:]) ** 2).mean())
+        copy_arm_mse = float(((gt[:, :6] - gt_target[:, :6]) ** 2).mean())
+        copy_hand_mse = float(((gt[:, 6:] - gt_target[:, 6:]) ** 2).mean())
+
+        onset_step = detect_grasp_onset(gt)
+
+        result = {
+            "traj_id": traj_id, "T": T, "onset_step": onset_step,
+            "ar_arm_mse": ar_arm_mse, "ar_hand_mse": ar_hand_mse,
+            "nc_arm_mse": nc_arm_mse, "nc_hand_mse": nc_hand_mse,
+            "copy_arm_mse": copy_arm_mse, "copy_hand_mse": copy_hand_mse,
+            "delta_z": rollout["delta_z"],
+            "mu_prior": rollout["mu_prior"],
+            "z_ctrl": rollout["z_ctrl"],
+        }
         all_results.append(result)
 
-        npz_path = os.path.join(args.output_dir, f"traj_{result['traj_id']}_eval.npz")
-        np_save = {k: v for k, v in result.items() if isinstance(v, np.ndarray)}
-        np.savez(npz_path, **np_save)
+        print(f"  AR  arm={ar_arm_mse:.6f}  hand={ar_hand_mse:.6f}")
+        print(f"  NC  arm={nc_arm_mse:.6f}  hand={nc_hand_mse:.6f}")
 
-        if not args.no_plot:
-            plot_trajectory_actions(result, args.output_dir)
-            plot_trajectory_mse(result, args.output_dir)
+        plot_trajectory_actions(
+            traj_id, T, gt_target, ar_runs, no_corr, args.num_samples,
+            args.output_dir, onset_step=onset_step,
+        )
+        plot_trajectory_mse(
+            traj_id, T, gt_target, ar_runs, no_corr, args.output_dir,
+            onset_step=onset_step,
+        )
 
-    summary = summarize_results(
-        all_results=all_results,
-        ckpt_path=args.ckpt,
-        test_dir=args.test_dir,
-        image_mode=args.image_mode,
-        feedback_horizon=feedback_horizon,
-        state_mask=state_mask,
-        num_samples=args.num_samples,
-    )
-
+    # ── Summary ──
     print("\n" + "=" * 70)
-    print(f"SUMMARY ({len(all_results)} trajectories, {args.num_samples} samples each)")
+    print(f"SUMMARY ({len(all_results)} trajectories, {args.num_samples} samples)")
     print("=" * 70)
-    print(f"  {'mode':<28} | {'arm_mse':>10} | {'hand_mse':>10}")
-    print(f"  {'-' * 28} | {'-' * 10} | {'-' * 10}")
-    print(
-        f"  {'Copy baseline (a[t+1]=a[t])':<28} | "
-        f"{summary['copy_baseline']['arm_mse']:>10.6f} | {summary['copy_baseline']['hand_mse']:>10.6f}"
-    )
-    for mode in MODES:
-        print(
-            f"  {MODE_LABELS[mode]:<28} | "
-            f"{summary['modes'][mode]['arm_mse']:>10.6f} | {summary['modes'][mode]['hand_mse']:>10.6f}"
-        )
+    mean_ar_arm = np.mean([r["ar_arm_mse"] for r in all_results])
+    mean_ar_hand = np.mean([r["ar_hand_mse"] for r in all_results])
+    mean_nc_arm = np.mean([r["nc_arm_mse"] for r in all_results])
+    mean_nc_hand = np.mean([r["nc_hand_mse"] for r in all_results])
+    mean_copy_arm = np.mean([r["copy_arm_mse"] for r in all_results])
+    mean_copy_hand = np.mean([r["copy_hand_mse"] for r in all_results])
+    print(f"  AR mean:        arm={mean_ar_arm:.6f}  hand={mean_ar_hand:.6f}")
+    print(f"  No-corr mean:   arm={mean_nc_arm:.6f}  hand={mean_nc_hand:.6f}")
+    print(f"  Copy baseline:  arm={mean_copy_arm:.6f}  hand={mean_copy_hand:.6f}")
 
-    print(
-        f"\n  Vision gain (no_corr - tf):  arm={summary['vision_gain_arm']:+.6f}  "
-        f"hand={summary['vision_gain_hand']:+.6f}"
-    )
-    print(
-        f"  AR drift (ar - tf):          arm={summary['ar_drift_arm']:+.6f}  "
-        f"hand={summary['ar_drift_hand']:+.6f}"
-    )
-    print(
-        f"  Onset detections: found={summary['onset_stats']['found']}  "
-        f"missing={summary['onset_stats']['missing']}  "
-        f"mean_step={summary['onset_stats']['mean_step']}"
-    )
-    for slice_name in SLICE_NAMES:
-        s = summary['slices'][slice_name]
-        if s['num_steps'] == 0:
-            continue
-        print(
-            f"  slice={slice_name:<10} steps={s['num_steps']:<4d}  "
-            f"tf_hand={s['modes']['tf']['hand_mse']:.6f}  "
-            f"no_corr_hand={s['modes']['no_corr']['hand_mse']:.6f}  "
-            f"vision_gain_hand={s['vision_gain_hand']:+.6f}"
-        )
+    all_dz = np.concatenate([r["delta_z"].reshape(-1, r["delta_z"].shape[-1])
+                              for r in all_results], axis=0)
+    dz_norm = np.linalg.norm(all_dz, axis=-1)
+    print(f"\n  delta_z norm:   mean={dz_norm.mean():.4f}  std={dz_norm.std():.4f}  "
+          f"max={dz_norm.max():.4f}")
 
-    summary_path = os.path.join(args.output_dir, 'summary.json')
-    with open(summary_path, 'w') as f:
+    summary = {
+        "ckpt": args.ckpt,
+        "num_samples": args.num_samples,
+        "dropout": dropout_rate,
+        "num_trajectories": len(all_results),
+        "ar_arm_mse": float(mean_ar_arm),
+        "ar_hand_mse": float(mean_ar_hand),
+        "nc_arm_mse": float(mean_nc_arm),
+        "nc_hand_mse": float(mean_nc_hand),
+        "copy_arm_mse": float(mean_copy_arm),
+        "copy_hand_mse": float(mean_copy_hand),
+        "delta_z_norm_mean": float(dz_norm.mean()),
+        "delta_z_norm_std": float(dz_norm.std()),
+        "per_trajectory": [
+            {
+                "traj_id": r["traj_id"], "T": r["T"], "onset_step": r["onset_step"],
+                "ar_arm_mse": r["ar_arm_mse"], "ar_hand_mse": r["ar_hand_mse"],
+                "nc_arm_mse": r["nc_arm_mse"], "nc_hand_mse": r["nc_hand_mse"],
+            }
+            for r in all_results
+        ],
+    }
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"\nSummary JSON saved: {summary_path}")
+    print(f"\n  Summary JSON: {summary_path}")
 
-    if not args.no_plot:
-        plot_summary(all_results, args.output_dir)
+    plot_summary(all_results, args.output_dir, args.num_samples)
+    plot_per_trajectory_bar(all_results, args.output_dir)
+    plot_latent_diagnostics(all_results, args.output_dir, args.num_samples)
+
+    print(f"\nAll figures saved to: {args.output_dir}/")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
