@@ -86,8 +86,6 @@ class BCDataset(Dataset):
         window_size: int = 8,
         noise_std_hand: float = 0.1,
         noise_std_arm: float = 0.0,
-        chunk_mode: bool = False,
-        future_horizon: int = 8,
     ):
         data_dir = Path(data_dir)
         traj_files = sorted(data_dir.glob("trajectory_*_demo_expert.pt"))
@@ -99,8 +97,6 @@ class BCDataset(Dataset):
         self.action_std = action_std.clone().float()
         self.noise_std_hand = float(noise_std_hand)
         self.noise_std_arm = float(noise_std_arm)
-        self.chunk_mode = chunk_mode
-        self.future_horizon = future_horizon
 
         # Per-trajectory tensors (preloaded into RAM)
         self.actions = []     # list of (T, 12) float32
@@ -174,20 +170,11 @@ class BCDataset(Dataset):
         if self.noise_std_hand > 0:
             past_hand_win = past_hand_win + torch.randn_like(past_hand_win) * self.noise_std_hand
 
-        # ── Target ──
-        if self.chunk_mode:
-            # Chunk target: (future_horizon, 12), right-padded with last frame
-            gt_frames = []
-            for offset in range(1, self.future_horizon + 1):
-                idx = min(t + offset, T - 1)
-                gt_frames.append(actions[idx])
-            gt_action = torch.stack(gt_frames, dim=0)
+        # ── Target: actions[t+1] (or actions[t] for last frame) ──
+        if t + 1 < T:
+            gt_action = actions[t + 1]
         else:
-            # Single-step target: actions[t+1] (or actions[t] for last frame)
-            if t + 1 < T:
-                gt_action = actions[t + 1]
-            else:
-                gt_action = actions[t]
+            gt_action = actions[t]
 
         return {
             "img_main": img_main,

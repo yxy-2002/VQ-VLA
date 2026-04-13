@@ -32,27 +32,20 @@ load_trajectory = eval_mod.load_trajectory
 rollout_ar = eval_mod.rollout_ar
 
 
-def evaluate_ckpt(ckpt_path, test_files, device, num_samples=1, rollout_stride=1):
+def evaluate_ckpt(ckpt_path, test_files, device, num_samples=1):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     action_mean = ckpt["action_mean"]
     action_std = ckpt["action_std"]
     bc_args = ckpt.get("args", {})
-    chunk_mode = bc_args.get("chunk_mode", False)
-    future_horizon = bc_args.get("future_horizon", 8) if chunk_mode else 1
 
-    vae_path = bc_args.get("vae_ckpt") or os.path.join(_PROJ_ROOT, "outputs/dim_2_best/checkpoint.pth")
-    vae, _ = build_and_freeze_vae(vae_path)
+    vae_path = bc_args.get("vae_ckpt") or os.path.join(_PROJ_ROOT, "pretrained_model/vae_single_step_ckpt/checkpoint.pth")
+    vae = build_and_freeze_vae(vae_path)
     policy = BCPolicy(
         vae=vae,
         arm_state_dim=bc_args.get("arm_state_dim", 6),
         feat_dim=bc_args.get("feat_dim", 128),
         fusion_dim=bc_args.get("fusion_dim", 256),
         dropout=bc_args.get("dropout", 0.0),
-        chunk_mode=chunk_mode,
-        future_horizon=future_horizon,
-        arm_gru_hidden=bc_args.get("arm_gru_hidden", 256),
-        action_mean=action_mean if chunk_mode else None,
-        action_std=action_std if chunk_mode else None,
     ).to(device)
     policy.load_state_dict(ckpt["model"], strict=False)
     policy.eval()
@@ -70,7 +63,6 @@ def evaluate_ckpt(ckpt_path, test_files, device, num_samples=1, rollout_stride=1
             policy=policy, traj=traj,
             action_mean=action_mean, action_std=action_std,
             num_samples=num_samples, device=device,
-            rollout_stride=rollout_stride,
         )
         ar_runs = rollout["ar_runs"]  # (S, T, 12)
         no_corr = rollout["no_corr"]  # (T, 12)

@@ -32,30 +32,6 @@ Inputs
                 → frozen VAE decoder → hand_action (6)
 ```
 
-## Chunk 模式 (BC + Chunk VAE)
-
-当 VAE checkpoint 为 chunk VAE (`HandActionChunkVAE`) 时，自动切换为 chunk 模式：
-
-```text
-Inputs：同上（单帧 obs + state + past_hand_win）
-
-ARM BRANCH (chunk):
-  [visual_feat, arm_state_feat] → arm_gru_init → GRU hidden
-  for step in range(future_horizon=8):
-      GRU(prev_arm + context, hidden) → delta
-      next_arm = prev_arm + delta           ← 残差预测，无界
-  → arm_action (B, 8, 6)
-
-HAND BRANCH (chunk):
-  frozen chunk VAE prior(past_hand_win) → (mu_prior, log_var_prior, hist_feat, current_state)
-  hand_prior_encoder([mu_p, lv_p]) → hand_prior_feat
-  [visual_feat, hand_prior_feat, arm_state_feat] → delta_z (2)
-  z_ctrl = mu_prior + delta_z
-  frozen chunk VAE decode(z_ctrl, hist_feat, current_state) → hand_action (B, 8, 6)
-```
-
-VAE 类型由 checkpoint 自动检测：`detect_vae_type()` 检查 state_dict 中是否存在 `decoder_cell.weight_ih` 键。
-
 ## Loss
 
 ```python
@@ -102,44 +78,11 @@ total_loss = arm_loss + hand_loss + reg_drift * drift_loss
     imitation_learning/behavior_clone/scripts/train.py \
     --train_dir data/20260327-11:10:43/demos/success/train \
     --test_dir  data/20260327-11:10:43/demos/success/test \
-    --vae_ckpt  outputs/dim_2_best/checkpoint.pth \
+    --vae_ckpt  pretrained_model/vae_single_step_ckpt/checkpoint.pth \
     --output_dir outputs/bc_output
 ```
 
 默认已包含 `--noise_std_hand 0.1`、`--noise_std_arm 0.1` 和 `--reg_drift 1.0`。
-
-### 训练（Chunk VAE 模式）
-
-```bash
-/home/cxl/miniconda3/envs/serl/bin/python \
-    imitation_learning/behavior_clone/scripts/train.py \
-    --train_dir data/20260327-11:10:43/demos/success/train \
-    --test_dir  data/20260327-11:10:43/demos/success/test \
-    --vae_ckpt  outputs/chunk_cvae_h8/checkpoint.pth \
-    --output_dir outputs/bc_chunk_output
-```
-
-传入 chunk VAE 的 checkpoint 后，chunk 模式会自动启用。`--future_horizon` 默认为 8。
-
-#### Chunk 模式最佳配置（由 sweep 得出）
-
-```bash
-/home/cxl/miniconda3/envs/serl/bin/python \
-    imitation_learning/behavior_clone/scripts/train.py \
-    --train_dir data/20260327-11:10:43/demos/success/train \
-    --test_dir  data/20260327-11:10:43/demos/success/test \
-    --vae_ckpt  outputs/chunk_cvae_h8/checkpoint.pth \
-    --output_dir outputs/bc_chunk_best \
-    --arm_gru_hidden 256 \
-    --noise_std_arm 0.1 \
-    --noise_std_hand 0.1 \
-    --reg_drift 0.5
-```
-
-关键发现（详见 EXPERIMENTS.md）：
-- **`reg_drift=0.5`** 比默认 1.0 更好：arm 和 hand 都同时改善（T4 最优）
-- `arm_gru_hidden=256` 比 128 更好，但加宽 `fusion_dim` 无收益
-- chunk 模式下 **val_mse 在 step ~2000 达到最佳**，之后轻微过拟合（考虑 total_steps=5000）
 
 ### 评估（AR + 可视化）
 
@@ -164,8 +107,6 @@ total_loss = arm_loss + hand_loss + reg_drift * drift_loss
 | feat_dim | 128 | 特征维度 |
 | fusion_dim | 256 | MLP 隐层宽度 |
 | dropout | 0.0 | arm/hand head 的 dropout |
-| future_horizon | 8 | chunk 模式下预测的未来帧数（自动从 VAE ckpt 读取） |
-| arm_gru_hidden | 256 | chunk 模式 arm GRU 隐层宽度 |
 
 ## 数据语义约定
 
