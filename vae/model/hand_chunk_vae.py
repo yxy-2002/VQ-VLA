@@ -6,8 +6,13 @@ Key design choices:
    inference uses a learned prior p(z | history).
 2) The decoder rolls out the future chunk autoregressively via GRU,
    so chunk boundaries are not generated as unrelated blocks.
-3) The decoder predicts bounded residual updates in logit space,
-   keeping outputs within (0, 1).
+3) The decoder predicts raw residual updates in the action space directly,
+   without logit-space bounded residual (no sigmoid). This avoids the
+   sigmoid flattening issue at basin edges (state≈0 or ≈1), which caused
+   stride<H rollout to fail.
+
+Output of each step: next_state = prev_state + raw_delta  (unconstrained).
+Training will naturally keep outputs in [0, 1] via MSE loss on real data.
 """
 
 import torch
@@ -157,11 +162,9 @@ class HandActionChunkVAE(nn.Module):
 
     # ── Decoder ──────────────────────────────────────────────────────────────
 
-    def _bounded_residual_update(self, prev_state: torch.Tensor, raw_delta: torch.Tensor) -> torch.Tensor:
-        eps = 1e-4
-        prev = prev_state.clamp(eps, 1.0 - eps)
-        prev_logit = torch.log(prev) - torch.log1p(-prev)
-        return torch.sigmoid(prev_logit + raw_delta)
+    def _linear_residual_update(self, prev_state: torch.Tensor, raw_delta: torch.Tensor) -> torch.Tensor:
+        """Raw residual in action space (no sigmoid). Outputs are unconstrained."""
+        return prev_state + raw_delta
 
     def decode(
         self,
@@ -176,7 +179,7 @@ class HandActionChunkVAE(nn.Module):
             cell_in = torch.cat([prev_state, hist_feat, z], dim=-1)
             hidden = self.decoder_cell(cell_in, hidden)
             raw_delta = self.decoder_out(hidden)
-            next_state = self._bounded_residual_update(prev_state, raw_delta)
+            next_state = self._linear_residual_update(prev_state, raw_delta)
             outputs.append(next_state)
             prev_state = next_state
         return torch.stack(outputs, dim=1)

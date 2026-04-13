@@ -71,7 +71,7 @@ def load_model_from_checkpoint(path, device):
 @torch.no_grad()
 def rollout_free_batch(model, seed, num_rollouts, max_steps, rollout_stride, deterministic=False):
     """
-    Batched chunk-based autoregressive rollout.
+    Batched chunk-based autoregressive rollout (stride mode).
 
     At each step: predict future_horizon frames, use the first `rollout_stride`
     frames, then slide the window forward by stride.
@@ -86,7 +86,6 @@ def rollout_free_batch(model, seed, num_rollouts, max_steps, rollout_stride, det
     t = 1
 
     while t < max_steps:
-        # Build window from existing actions
         window = actions[:, max(0, t - window_size) : t, :]
         if window.shape[1] < window_size:
             pad = actions[:, 0:1, :].expand(-1, window_size - window.shape[1], -1)
@@ -96,6 +95,64 @@ def rollout_free_batch(model, seed, num_rollouts, max_steps, rollout_stride, det
         take = min(max(1, rollout_stride), future_horizon, max_steps - t)
         actions[:, t : t + take, :] = pred_chunk[:, :take, :]
         t += take
+
+    return actions.cpu().numpy()
+
+
+@torch.no_grad()
+def rollout_free_batch_ensemble(model, seed, num_rollouts, max_steps, ensemble_k=0.01, deterministic=False):
+    """
+    Temporal ensemble rollout (ACT-style).
+
+    At every time step t, predict a full H-frame chunk and store it.
+    The executed action at time t is a weighted average of all stored chunks
+    that cover time t (i.e., predicted at times t-H+1 .. t). The weights are
+    exp(-ensemble_k * age) where age = t - t_pred (newer predictions get higher weight).
+    """
+    device = next(model.parameters()).device
+    window_size = model.window_size
+    H = model.future_horizon
+    action_dim = seed.shape[-1]
+
+    actions = torch.zeros(num_rollouts, max_steps, action_dim, device=device)
+    actions[:, 0, :] = seed[0].to(device)
+
+    # Store all predicted chunks: (num_rollouts, max_steps, H, action_dim)
+    # all_chunks[:, t_pred, offset, :] = chunk predicted at t_pred, frame t_pred+offset
+    all_chunks = torch.zeros(num_rollouts, max_steps, H, action_dim, device=device)
+    chunk_valid = torch.zeros(max_steps, dtype=torch.bool, device=device)
+
+    for t in range(1, max_steps):
+        # Build window from aggregated actions so far
+        window = actions[:, max(0, t - window_size) : t, :]
+        if window.shape[1] < window_size:
+            pad = actions[:, 0:1, :].expand(-1, window_size - window.shape[1], -1)
+            window = torch.cat([pad, window], dim=1)
+
+        # Predict new chunk covering times [t..t+H-1]
+        new_chunk = model.predict(window, deterministic=deterministic)  # (B, H, D)
+        all_chunks[:, t] = new_chunk
+        chunk_valid[t] = True
+
+        # Collect all chunks covering time t: predicted at t_pred in [t-H+1..t]
+        t_low = max(1, t - H + 1)
+        preds = []
+        ages = []
+        for tp in range(t_low, t + 1):
+            if not chunk_valid[tp]:
+                continue
+            offset = t - tp
+            preds.append(all_chunks[:, tp, offset, :])
+            ages.append(t - tp)
+        if not preds:
+            continue
+
+        stacked = torch.stack(preds, dim=0)  # (N, B, D)
+        ages_tensor = torch.tensor(ages, dtype=torch.float32, device=device)
+        weights = torch.exp(-ensemble_k * ages_tensor)  # (N,)
+        weights = weights / weights.sum()
+        weighted = (stacked * weights.view(-1, 1, 1)).sum(0)  # (B, D)
+        actions[:, t, :] = weighted
 
     return actions.cpu().numpy()
 
@@ -204,6 +261,14 @@ def get_args():
     p.add_argument("--num_samples", type=int, default=200)
     p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--rollout_stride", type=int, default=1)
+    p.add_argument("--rollout_mode", type=str, default="stride",
+                   choices=["stride", "ensemble"],
+                   help="stride: use rollout_stride frames per chunk; "
+                        "ensemble: ACT-style temporal ensemble")
+    p.add_argument("--ensemble_k", type=float, default=0.01,
+                   help="Exponential decay coefficient for temporal ensemble. "
+                        "Smaller → more uniform weighting across chunks; "
+                        "larger → bias toward newest prediction")
     p.add_argument("--threshold", type=float, default=0.2)
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--init_state", type=float, nargs=6, default=None)
@@ -223,7 +288,8 @@ def main():
     print(f"  arch: window={model_kwargs['window_size']}  horizon={model_kwargs['future_horizon']}  "
           f"hidden={model_kwargs['hidden_dim']}  latent={model_kwargs['latent_dim']}  "
           f"encoder={model_kwargs['encoder_type']}  depth={model_kwargs['num_hidden_layers']}")
-    print(f"  rollout_stride={args.rollout_stride}  "
+    print(f"  rollout_mode={args.rollout_mode}  "
+          f"stride={args.rollout_stride}  ensemble_k={args.ensemble_k}  "
           f"{'deterministic' if args.deterministic else f'stochastic ({args.num_samples} samples)'}")
 
     # Seed
@@ -233,14 +299,24 @@ def main():
         seed = torch.tensor(DEFAULT_INIT, dtype=torch.float32).unsqueeze(0)
 
     # Rollout
-    runs = rollout_free_batch(
-        model,
-        seed=seed,
-        num_rollouts=args.num_samples,
-        max_steps=args.max_steps,
-        rollout_stride=args.rollout_stride,
-        deterministic=args.deterministic,
-    )
+    if args.rollout_mode == "ensemble":
+        runs = rollout_free_batch_ensemble(
+            model,
+            seed=seed,
+            num_rollouts=args.num_samples,
+            max_steps=args.max_steps,
+            ensemble_k=args.ensemble_k,
+            deterministic=args.deterministic,
+        )
+    else:
+        runs = rollout_free_batch(
+            model,
+            seed=seed,
+            num_rollouts=args.num_samples,
+            max_steps=args.max_steps,
+            rollout_stride=args.rollout_stride,
+            deterministic=args.deterministic,
+        )
 
     # Print summary
     print(f"\nFree-run: {args.max_steps} steps, {args.num_samples} samples")

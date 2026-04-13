@@ -70,6 +70,8 @@ def get_args():
     p.add_argument("--fusion_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0,
                    help="Dropout probability in the arm/head MLPs")
+    p.add_argument("--arm_gru_hidden", type=int, default=256,
+                   help="Hidden dim for arm GRU decoder (chunk mode only)")
     # Training
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=5e-4,
@@ -91,6 +93,8 @@ def get_args():
                         "MSE(hand_action, hand_no_corr). hand_no_corr is the frozen "
                         "decoder output at mu_prior, so the regularizer penalizes how "
                         "far the hand branch pushes the latent away from the prior mean.")
+    p.add_argument("--future_horizon", type=int, default=8,
+                   help="Number of future frames to predict in chunk mode")
     p.add_argument("--num_workers", type=int, default=0,
                    help="0 = single process. Default is 0 because all data is "
                         "preloaded into RAM and forking workers can blow /dev/shm.")
@@ -108,7 +112,7 @@ def get_args():
 
 
 @torch.no_grad()
-def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device) -> dict:
+def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device, chunk_mode: bool = False) -> dict:
     """Eval set MSE for arm, hand, and the no-correction baseline (delta_z = 0)."""
     policy.eval()
 
@@ -117,8 +121,12 @@ def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device) -> dict
     for batch in loader:
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         gt = batch["gt_action"]
-        arm_gt = gt[:, :6]
-        hand_gt = gt[:, 6:]
+        if chunk_mode:
+            arm_gt = gt[:, :, :6]
+            hand_gt = gt[:, :, 6:]
+        else:
+            arm_gt = gt[:, :6]
+            hand_gt = gt[:, 6:]
 
         out = policy(
             img_main=batch["img_main"],
@@ -158,15 +166,19 @@ def evaluate(policy: BCPolicy, loader: DataLoader, device: torch.device) -> dict
 # ─── Checkpoint ────────────────────────────────────────────────────────────────
 
 
-def save_checkpoint(policy, optimizer, step, output_dir, action_mean, action_std, args):
+def save_checkpoint(policy, optimizer, step, output_dir, action_mean, action_std, args,
+                    chunk_mode=False, future_horizon=1):
     os.makedirs(output_dir, exist_ok=True)
+    saved_args = vars(args).copy()
+    saved_args["chunk_mode"] = chunk_mode
+    saved_args["future_horizon"] = future_horizon
     state = {
         "model": strip_vae_state_dict(policy.state_dict()),
         "optimizer": optimizer.state_dict(),
         "step": step,
         "action_mean": action_mean,
         "action_std": action_std,
-        "args": vars(args),
+        "args": saved_args,
     }
     torch.save(state, os.path.join(output_dir, f"checkpoint-{step}.pth"))
     torch.save(state, os.path.join(output_dir, "checkpoint.pth"))
@@ -280,18 +292,28 @@ def main():
     print(f"  action_mean = {[round(x, 3) for x in action_mean.tolist()]}")
     print(f"  action_std  = {[round(x, 3) for x in action_std.tolist()]}")
 
+    # ── VAE: auto-detect type ──
+    vae, vae_type = build_and_freeze_vae(args.vae_ckpt)
+    chunk_mode = (vae_type == "chunk")
+    future_horizon = args.future_horizon if chunk_mode else 1
+    print(f"[VAE] type={vae_type}  chunk_mode={chunk_mode}  future_horizon={future_horizon}")
+
     # ── Datasets ──
     train_ds = BCDataset(
         args.train_dir, action_mean=action_mean, action_std=action_std,
         window_size=args.window_size,
         noise_std_hand=args.noise_std_hand,
         noise_std_arm=args.noise_std_arm,
+        chunk_mode=chunk_mode,
+        future_horizon=future_horizon,
     )
     test_ds = BCDataset(
         args.test_dir, action_mean=action_mean, action_std=action_std,
         window_size=args.window_size,
         noise_std_hand=0.0,   # never noise the eval split
         noise_std_arm=0.0,
+        chunk_mode=chunk_mode,
+        future_horizon=future_horizon,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -303,16 +325,23 @@ def main():
     )
 
     # ── Model: frozen VAE wrapped inside BCPolicy ──
-    vae = build_and_freeze_vae(args.vae_ckpt)
     policy = BCPolicy(
         vae=vae,
         arm_state_dim=6,
         feat_dim=args.feat_dim,
         fusion_dim=args.fusion_dim,
         dropout=args.dropout,
+        chunk_mode=chunk_mode,
+        future_horizon=future_horizon,
+        arm_gru_hidden=args.arm_gru_hidden,
+        action_mean=action_mean if chunk_mode else None,
+        action_std=action_std if chunk_mode else None,
     ).to(device)
     print(f"[Aug] noise_std_hand={args.noise_std_hand}  noise_std_arm={args.noise_std_arm}")
-    print("[Arch] BC 3.0 — weakly-coupled arm/hand branches, hand conditioned on arm.")
+    if chunk_mode:
+        print(f"[Arch] BC chunk — arm GRU decoder + chunk VAE hand, horizon={future_horizon}")
+    else:
+        print("[Arch] BC 3.0 — weakly-coupled arm/hand branches, hand conditioned on arm.")
 
     n_total = sum(p.numel() for p in policy.parameters())
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -346,7 +375,7 @@ def main():
     policy.train()
 
     print("[Sanity] Step-0 evaluation:")
-    init_eval = evaluate(policy, test_loader, device)
+    init_eval = evaluate(policy, test_loader, device, chunk_mode=chunk_mode)
     print(f"  arm_mse                = {init_eval['arm_mse']:.6f}")
     print(f"  hand_mse_full          = {init_eval['hand_mse_full']:.6f}")
     print(f"  hand_mse_no_correction = {init_eval['hand_mse_no_correction']:.6f}")
@@ -385,8 +414,12 @@ def main():
             state=batch["state"],
             past_hand_win=batch["past_hand_win"],
         )
-        arm_loss = F.mse_loss(out["arm_action"], gt[:, :6])
-        hand_loss = F.mse_loss(out["hand_action"], gt[:, 6:])
+        if chunk_mode:
+            arm_loss = F.mse_loss(out["arm_action"], gt[:, :, :6])
+            hand_loss = F.mse_loss(out["hand_action"], gt[:, :, 6:])
+        else:
+            arm_loss = F.mse_loss(out["arm_action"], gt[:, :6])
+            hand_loss = F.mse_loss(out["hand_action"], gt[:, 6:])
         # Drift regularizer: pull BC's hand prediction toward the decoder output
         # at the frozen prior mean. The decoder is frozen, so gradients flow only
         # through the corrected hand path.
@@ -413,7 +446,7 @@ def main():
                   f"lr={lr_schedule[step]:.2e}  ({elapsed:.0f}s)")
 
         if step > 0 and step % args.eval_freq == 0:
-            ev = evaluate(policy, test_loader, device)
+            ev = evaluate(policy, test_loader, device, chunk_mode=chunk_mode)
             history["eval_steps"].append(step)
             history["val_arm"].append(ev["arm_mse"])
             history["val_hand_full"].append(ev["hand_mse_full"])
@@ -427,13 +460,15 @@ def main():
 
         if step > 0 and step % args.save_freq == 0:
             save_checkpoint(policy, optimizer, step, args.output_dir,
-                            action_mean, action_std, args)
+                            action_mean, action_std, args,
+                            chunk_mode=chunk_mode, future_horizon=future_horizon)
             print(f"           checkpoint saved -> {args.output_dir}/checkpoint-{step}.pth")
 
     # ── Final eval + save ──
     save_checkpoint(policy, optimizer, args.total_steps, args.output_dir,
-                    action_mean, action_std, args)
-    ev = evaluate(policy, test_loader, device)
+                    action_mean, action_std, args,
+                    chunk_mode=chunk_mode, future_horizon=future_horizon)
+    ev = evaluate(policy, test_loader, device, chunk_mode=chunk_mode)
     history["eval_steps"].append(args.total_steps)
     history["val_arm"].append(ev["arm_mse"])
     history["val_hand_full"].append(ev["hand_mse_full"])

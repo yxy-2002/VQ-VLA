@@ -29,6 +29,108 @@ training_curves.png 路径。
 
 ---
 
+## 2026-04-12 · v9 chunk hyperparameter sweep — noise_std_arm / reg_drift / noise_std_hand
+
+### 动机
+
+在 v8 的 A2 架构基础上（arm_gru_hidden=256），扫描训练超参数（noise_std_arm、noise_std_hand、reg_drift），目标是**在不退化 hand 性能的前提下进一步优化 arm**。
+
+### 代码改动
+
+无（仅 CLI 参数变化）。
+
+### 数据
+
+同 v6/v7/v8。Copy baseline 未直接测，但 hand_no_corr=0.0334。
+
+### 配置
+
+固定 `arm_gru_hidden=256`, `total_steps=5000`, `lr=5e-4`, `batch_size=128`。
+
+| ID | noise_arm | noise_hand | reg_drift | 备注 |
+|----|-----------|-----------|-----------|------|
+| T1 | 0.05 | 0.1 | 1.0 | 降低 arm noise |
+| T2 (=A2) | 0.1 | 0.1 | 1.0 | 基准 |
+| T3 | 0.2 | 0.1 | 1.0 | 增大 arm noise |
+| T4 | 0.1 | 0.1 | **0.5** | 降低 drift reg |
+| T5 | 0.1 | 0.1 | **2.0** | 增大 drift reg |
+| T6 | 0.1 | 0.05 | 1.0 | 降低 hand noise |
+
+### 结果（Final val，step=5000）
+
+| ID | val arm | val hand | vision_gain |
+|----|---------|----------|-------------|
+| T1 | 0.0607 | 0.0150 | +0.0183 |
+| T2 (=A2) | 0.0626 | 0.0148 | +0.0186 |
+| T3 | 0.0632 | 0.0146 | +0.0187 |
+| **T4** | **0.0602** ⭐ | **0.0122** ⭐ | **+0.0212** ⭐ |
+| T5 | 0.0618 | 0.0216 | +0.0118 |
+| T6 | 0.0606 | 0.0146 | +0.0188 |
+
+### 关键发现
+
+1. **T4 (reg_drift=0.5) 全面胜出**：arm (0.0602) 和 hand (0.0122) **同时**比 baseline 更好。这是"不损害手部的前提下优化腕部"的最佳答案。
+2. **reg_drift 偏大有害**：T5 (drift=2.0) 让 hand 退化 46% (0.015 → 0.022)，vision_gain 降低到 +0.0118。
+3. **arm noise 调整效果很小**：T1 (0.05) 和 T3 (0.2) 与 baseline 差距 < 5%，说明 noise_std_arm=0.1 已接近最优。
+4. **hand noise 降到 0.05 (T6) 基本无影响**，可保留 0.1 更稳妥。
+
+**推荐 chunk 模式最佳配置**：`arm_gru_hidden=256, noise_std_arm=0.1, noise_std_hand=0.1, reg_drift=0.5`。
+
+---
+
+## 2026-04-12 · v8 chunk architecture sweep — arm GRU 隐层宽度
+
+### 动机
+
+引入 chunk VAE 后，arm 分支改用 GRU 自回归 decoder 生成 8 帧 action chunk。本次 sweep 在固定训练超参下，扫描 arm GRU 隐层宽度和整体 fusion 宽度，**目标是在不退化 hand 性能的前提下找到 arm 最优 GRU 配置**。
+
+### 代码改动
+
+- `model/bc_policy.py` — 新增 `HandActionChunkVAE` import、`detect_vae_type` 自动识别、`build_and_freeze_vae` 返回 (vae, type)、`BCPolicy` 支持 `chunk_mode` 分支（arm GRU decoder + chunk VAE decode）
+- `model/bc_dataset.py` — 新增 `chunk_mode`/`future_horizon` 参数，chunk 模式下 gt_action 变为 (future_horizon, 12)
+- `scripts/train.py` — 自动检测 chunk_mode，调整 loss 切片（(B,H,12) vs (B,12)），保存到 ckpt["args"]
+- `scripts/eval.py` — 支持 chunk ckpt 加载，AR rollout 使用 chunk 首帧
+
+### 关键 bug 及修复
+
+**初始实现有致命 bug**：hand decode 被错误地包在 `torch.no_grad()` 中，导致 delta_z 完全不学（vision_gain = 0.0 throughout 10k steps）。修复后（移除 no_grad 包裹，保持与单步模式一致）vision_gain 恢复到 +0.018+。
+
+### 数据
+
+同 v6/v7。VAE 使用 `outputs/chunk_cvae_h8/checkpoint.pth`（window=8, horizon=8, latent=2）。
+
+### 配置
+
+固定 `noise_std_arm=0.1, noise_std_hand=0.1, reg_drift=1.0, total_steps=10000, lr=5e-4`。
+
+| ID | arm_gru_hidden | fusion_dim | 备注 |
+|----|---------------|------------|------|
+| A1 | 128 | 256 | 窄 GRU |
+| A2 | 256 | 256 | 默认 |
+| A3 | 256 | 512 | 加宽 fusion |
+
+### 结果（Final val，step=10000）
+
+| ID | best arm (step 2k) | Final arm | Final hand | vision_gain |
+|----|-------------------|-----------|-----------|-------------|
+| A1 | 0.0578 | 0.0652 | 0.0153 | +0.0181 |
+| **A2** | **0.0549** ⭐ | 0.0626 | 0.0148 | +0.0186 |
+| A3 | 0.0562 | 0.0640 | 0.0146 | +0.0188 |
+
+### 关键发现
+
+1. **A2 (arm_gru_hidden=256) 最优**，比 A1 (128) 好 4%，比 A3 (fusion=512) 好 2%。加宽无收益符合 v5 的发现。
+2. **所有配置在 step ~2000 达到最佳**，之后轻微过拟合。chunk 模式收敛更快（总步数只要单步模式的 1/4）。
+3. Hand 在所有架构下稳定（0.0146-0.0153），说明 arm GRU 宽度对 hand 基本无影响（符合 weakly-coupled 的设计）。
+4. chunk 模式 per-step 比单步慢 ~33%（40ms vs 30ms），因为 arm 和 hand 都要跑 8 步 GRU 循环，但总训练步数更少，**总训练时长反而略短**。
+
+### 推荐继续试的方向
+
+- Early stopping at step 2000
+- Phase 3: reg_drift / noise 的 sweep（见 v9）
+
+---
+
 ## 2026-04-11 · v7 arm noise sweep — arm state 训练噪声对 AR 性能的影响
 
 ### 动机

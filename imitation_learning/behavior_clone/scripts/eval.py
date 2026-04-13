@@ -86,13 +86,19 @@ def rollout_ar(
     num_samples: int,
     device: torch.device,
     window_size: int = 8,
+    rollout_stride: int = 1,
 ) -> dict:
     """AR rollout: both arm and hand predictions fed back to next step.
+
+    In chunk mode, `rollout_stride` controls how many frames from each predicted
+    chunk to execute before re-predicting. stride=1 matches single-step behavior
+    (re-predict every frame); stride=future_horizon matches the VAE-eval setting
+    (execute the full chunk, re-predict every H frames).
 
     Returns dict with:
         ar_runs:    (num_samples, T, 12)
         no_corr:    (T, 12) deterministic no-correction baseline
-        delta_z:    (num_samples, T, latent_dim)
+        delta_z:    (num_samples, T, latent_dim)  [frame the prediction was made at]
         mu_prior:   (num_samples, T, latent_dim)
         z_ctrl:     (num_samples, T, latent_dim)
     """
@@ -103,6 +109,9 @@ def rollout_ar(
     action_mean_d = action_mean.to(device)
     action_std_d = action_std.to(device)
     latent_dim = int(policy.latent_dim)
+    chunk_mode = getattr(policy, "chunk_mode", False)
+    H = getattr(policy, "future_horizon", 1) if chunk_mode else 1
+    stride = max(1, min(rollout_stride, H))
 
     policy.train()  # enable dropout if any
 
@@ -115,7 +124,8 @@ def rollout_ar(
         for s in range(num_samples):
             action_seq = actions.clone()
 
-            for t in range(T):
+            t = 0
+            while t < T:
                 state = (action_seq[t:t + 1] - action_mean_d) / action_std_d
                 window = build_past_window(action_seq[:, 6:12], t, window_size).unsqueeze(0)
                 img_main = (main_imgs[t].float() / 255.0).unsqueeze(0)
@@ -126,20 +136,37 @@ def rollout_ar(
                     state=state, past_hand_win=window,
                 )
 
-                ar_runs[s, t, :] = out["action_pred"][0]
-                delta_z_all[s, t, :] = out["delta_z"][0]
-                mu_prior_all[s, t, :] = out["mu_prior"][0]
-                z_ctrl_all[s, t, :] = out["z_ctrl"][0]
-
-                if t + 1 < T:
-                    action_seq[t + 1, :] = out["action_pred"][0]
+                raw_pred = out["action_pred"][0]  # (12,) single or (H, 12) chunk
+                if chunk_mode and raw_pred.dim() == 2:
+                    # Take first `stride` frames of the chunk, write to action_seq.
+                    take = min(stride, T - t)
+                    chunk = raw_pred[:take]  # (take, 12)
+                    for k in range(take):
+                        ar_runs[s, t + k, :] = chunk[k]
+                        delta_z_all[s, t + k, :] = out["delta_z"][0]
+                        mu_prior_all[s, t + k, :] = out["mu_prior"][0]
+                        z_ctrl_all[s, t + k, :] = out["z_ctrl"][0]
+                        if t + k + 1 < T:
+                            action_seq[t + k + 1, :] = chunk[k]
+                    t += take
+                else:
+                    # Single-step mode
+                    pred = raw_pred
+                    ar_runs[s, t, :] = pred
+                    delta_z_all[s, t, :] = out["delta_z"][0]
+                    mu_prior_all[s, t, :] = out["mu_prior"][0]
+                    z_ctrl_all[s, t, :] = out["z_ctrl"][0]
+                    if t + 1 < T:
+                        action_seq[t + 1, :] = pred
+                    t += 1
 
     # No-correction baseline (eval mode, delta_z=0)
     policy.eval()
     no_corr = torch.zeros((T, 12), device=device)
     with torch.no_grad():
         action_seq = actions.clone()
-        for t in range(T):
+        t = 0
+        while t < T:
             state = (action_seq[t:t + 1] - action_mean_d) / action_std_d
             window = build_past_window(action_seq[:, 6:12], t, window_size).unsqueeze(0)
             img_main = (main_imgs[t].float() / 255.0).unsqueeze(0)
@@ -148,9 +175,21 @@ def rollout_ar(
                 img_main=img_main, img_extra=img_extra,
                 state=state, past_hand_win=window, zero_delta=True,
             )
-            no_corr[t, :] = out["action_pred"][0]
+            raw_pred = out["action_pred"][0]
+            if chunk_mode and raw_pred.dim() == 2:
+                take = min(stride, T - t)
+                chunk = raw_pred[:take]
+                for k in range(take):
+                    no_corr[t + k, :] = chunk[k]
+                    if t + k + 1 < T:
+                        action_seq[t + k + 1, :] = chunk[k]
+                t += take
+                continue
+            pred = raw_pred
+            no_corr[t, :] = pred
             if t + 1 < T:
-                action_seq[t + 1, :] = out["action_pred"][0]
+                action_seq[t + 1, :] = pred
+            t += 1
 
     return {
         "ar_runs": ar_runs.cpu().numpy(),
@@ -181,7 +220,8 @@ def detect_grasp_onset(actions, threshold=0.02, lookahead=3, min_count=2):
 
 
 def plot_trajectory_actions(traj_id, T, gt_target, ar_runs, no_corr,
-                            num_samples, output_dir, onset_step=None):
+                            num_samples, output_dir, onset_step=None,
+                            xlim_max=None, xtick_step=5):
     """4x3 grid: 12 joints with GT / AR samples / mean / std / no-corr."""
     import matplotlib
     matplotlib.use("Agg")
@@ -218,6 +258,9 @@ def plot_trajectory_actions(traj_id, T, gt_target, ar_runs, no_corr,
             ax.axvline(onset_step, color="red", linestyle=":", linewidth=1.0, alpha=0.6)
         ax.set_ylabel(name, fontsize=10)
         ax.grid(True, alpha=0.3)
+        if xlim_max is not None:
+            ax.set_xlim(0, xlim_max)
+            ax.set_xticks(np.arange(0, xlim_max + 1, xtick_step))
         if i == 0:
             ax.legend(fontsize=7, loc="best")
 
@@ -232,7 +275,8 @@ def plot_trajectory_actions(traj_id, T, gt_target, ar_runs, no_corr,
 
 
 def plot_trajectory_mse(traj_id, T, gt_target, ar_runs, no_corr,
-                        output_dir, onset_step=None):
+                        output_dir, onset_step=None,
+                        xlim_max=None, xtick_step=5):
     """Per-step MSE: arm and hand side-by-side."""
     import matplotlib
     matplotlib.use("Agg")
@@ -267,6 +311,9 @@ def plot_trajectory_mse(traj_id, T, gt_target, ar_runs, no_corr,
         ax.set_ylabel("MSE")
         ax.set_title(f"{side} MSE")
         ax.grid(True, alpha=0.3)
+        if xlim_max is not None:
+            ax.set_xlim(0, xlim_max)
+            ax.set_xticks(np.arange(0, xlim_max + 1, xtick_step))
         ax.legend(fontsize=8, loc="best")
 
     fig.tight_layout()
@@ -414,6 +461,10 @@ def main():
     parser.add_argument("--test_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--num_samples", type=int, default=5)
+    parser.add_argument("--rollout_stride", type=int, default=1,
+                        help="Frames to execute from each predicted chunk "
+                             "before re-predicting (chunk mode only). "
+                             "stride=1: step-by-step; stride=future_horizon: full-chunk")
     parser.add_argument("--vae_ckpt", type=str, default=None)
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
@@ -434,13 +485,20 @@ def main():
         or bc_args.get("vae_ckpt")
         or os.path.join(_PROJ_ROOT, "outputs/dim_2_best/checkpoint.pth")
     )
-    vae = build_and_freeze_vae(vae_path)
+    vae, vae_type = build_and_freeze_vae(vae_path)
+    chunk_mode = bc_args.get("chunk_mode", False)
+    future_horizon = bc_args.get("future_horizon", 8) if chunk_mode else 1
     policy = BCPolicy(
         vae=vae,
         arm_state_dim=bc_args.get("arm_state_dim", 6),
         feat_dim=bc_args.get("feat_dim", 128),
         fusion_dim=bc_args.get("fusion_dim", 256),
         dropout=bc_args.get("dropout", 0.0),
+        chunk_mode=chunk_mode,
+        future_horizon=future_horizon,
+        arm_gru_hidden=bc_args.get("arm_gru_hidden", 256),
+        action_mean=action_mean if chunk_mode else None,
+        action_std=action_std if chunk_mode else None,
     ).to(device)
     missing, unexpected = policy.load_state_dict(bc_ckpt["model"], strict=False)
     bc_only_missing = [k for k in missing if not k.startswith("vae.")]
@@ -461,6 +519,16 @@ def main():
     files = sorted(glob.glob(os.path.join(test_dir, "trajectory_*_demo_expert.pt")))
     print(f"Found {len(files)} test trajectories in {test_dir}")
 
+    # Pre-scan trajectory lengths so every per-traj plot can share the same x-axis.
+    # Round up to the next multiple of xtick_step for clean ticks.
+    xtick_step = 5
+    max_T_raw = 0
+    for f in files:
+        data = torch.load(f, map_location="cpu", weights_only=False)
+        max_T_raw = max(max_T_raw, int(data["actions"].shape[0]))
+    global_xlim = int(np.ceil(max_T_raw / xtick_step) * xtick_step)
+    print(f"Shared x-axis: xlim=[0, {global_xlim}]  (max T={max_T_raw}, step={xtick_step})")
+
     # ── Evaluate each trajectory ──
     all_results = []
     for fi, f in enumerate(files):
@@ -476,6 +544,7 @@ def main():
             policy=policy, traj=traj,
             action_mean=action_mean, action_std=action_std,
             num_samples=args.num_samples, device=device,
+            rollout_stride=args.rollout_stride,
         )
 
         ar_runs = rollout["ar_runs"]
@@ -507,10 +576,12 @@ def main():
         plot_trajectory_actions(
             traj_id, T, gt_target, ar_runs, no_corr, args.num_samples,
             args.output_dir, onset_step=onset_step,
+            xlim_max=global_xlim, xtick_step=xtick_step,
         )
         plot_trajectory_mse(
             traj_id, T, gt_target, ar_runs, no_corr, args.output_dir,
             onset_step=onset_step,
+            xlim_max=global_xlim, xtick_step=xtick_step,
         )
 
     # ── Summary ──
