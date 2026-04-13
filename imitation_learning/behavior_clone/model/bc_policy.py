@@ -1,9 +1,11 @@
 """
 Behavior cloning policy over a frozen single-step Hand-Action VAE.
 
-Architecture:
-  - arm_head MLP → arm_action (B, 6)
-  - hand delta_z → frozen VAE.decode(z_ctrl) → hand_action (B, 6)
+Visual encoder: shared pretrained ResNet-18 (HuggingFace) per view → (B, 512) each.
+Two views concatenated into visual_feat (B, 1024). No fusion MLP.
+
+Arm branch: MLP → arm_action (B, 6)
+Hand branch: MLP → delta_z → frozen VAE.decode(mu_prior + delta_z) → hand_action (B, 6)
 """
 
 import importlib.util
@@ -11,6 +13,8 @@ import os
 
 import torch
 import torch.nn as nn
+
+from transformers import ResNetModel
 
 
 # ─── Module loaders ──────────────────────────────────────────────────────────
@@ -55,35 +59,70 @@ def build_and_freeze_vae(ckpt_path: str):
     return vae
 
 
-# ─── Vision encoder ──────────────────────────────────────────────────────────
+# ─── Visual backbone ─────────────────────────────────────────────────────────
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+_DEFAULT_RESNET_PATH = os.path.join(_PROJ_ROOT, "pretrained_model/resnet-18")
 
 
-class SimpleCNN(nn.Module):
-    """4-block CNN with GroupNorm. Input (B, 3, 128, 128) → (B, out_dim)."""
+class ResNet18Backbone(nn.Module):
+    """Shared pretrained ResNet-18 backbone (HF format).
 
-    def __init__(self, out_dim: int = 128):
+    Input: pixel values (B, 3, H, W) in [0, 1] range (will be ImageNet-normalized here).
+    Output: (B, 512) pooled features.
+    """
+
+    def __init__(self, pretrained_path: str = _DEFAULT_RESNET_PATH, freeze: bool = False):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
-            nn.GroupNorm(8, 32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(128, out_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.resnet = ResNetModel.from_pretrained(pretrained_path)
+        self.freeze_backbone = freeze
+        self.register_buffer("_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1))
+        self.register_buffer("_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1))
+        if freeze:
+            for p in self.resnet.parameters():
+                p.requires_grad_(False)
+            self.resnet.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.resnet.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # x in [0,1]; normalize with ImageNet stats
+        x = (x - self._mean) / self._std
+        out = self.resnet(pixel_values=x)
+        return out.pooler_output.flatten(1)  # (B, 512)
+
+
+# ─── State / prior encoder factory ───────────────────────────────────────────
+
+
+def build_state_encoder(in_dim: int, encoder_type: str):
+    """Return (module, out_dim) for the given encoder variant.
+
+    Variants:
+      - "mlp": 2-layer MLP in_dim → 128 → 128 (ReLU)          [out_dim=128]
+      - "linear64": single Linear in_dim → 64 + ReLU           [out_dim=64]
+      - "raw": Identity passthrough                            [out_dim=in_dim]
+    """
+    if encoder_type == "mlp":
+        mod = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+        )
+        return mod, 128
+    if encoder_type == "linear64":
+        mod = nn.Sequential(nn.Linear(in_dim, 64), nn.ReLU(inplace=True))
+        return mod, 64
+    if encoder_type == "raw":
+        return nn.Identity(), in_dim
+    raise ValueError(f"Unknown state_encoder_type: {encoder_type!r}")
 
 
 # ─── BC policy ───────────────────────────────────────────────────────────────
@@ -92,71 +131,61 @@ class SimpleCNN(nn.Module):
 class BCPolicy(nn.Module):
     """Single-step BC policy with weakly-coupled arm and hand branches.
 
-    Predicts one next action (B, 12) per call.
+    Visual features: shared ResNet-18 on each view → (B, 512); two views concatenated
+    → visual_feat (B, 1024). No fusion MLP.
     """
+
+    VISUAL_DIM = 1024  # 2 views x 512
 
     def __init__(
         self,
         vae: nn.Module,
+        backbone: nn.Module,
         arm_state_dim: int = 6,
-        feat_dim: int = 128,
-        fusion_dim: int = 256,
+        state_encoder_type: str = "mlp",
         dropout: float = 0.0,
     ):
         super().__init__()
         self.vae = vae
+        self.backbone = backbone
         self.latent_dim = vae.latent_dim
         self.arm_state_dim = arm_state_dim
-        self.feat_dim = feat_dim
+        self.state_encoder_type = state_encoder_type
 
-        # Shared encoders
-        self.cnn_main = SimpleCNN(out_dim=feat_dim)
-        self.cnn_extra = SimpleCNN(out_dim=feat_dim)
-
-        self.visual_fusion = nn.Sequential(
-            nn.Linear(feat_dim * 2, feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim),
-            nn.ReLU(inplace=True),
+        # Arm / hand-prior encoders (variant-driven)
+        self.arm_state_encoder, arm_feat_dim = build_state_encoder(
+            arm_state_dim, state_encoder_type,
         )
-
-        self.arm_state_encoder = nn.Sequential(
-            nn.Linear(arm_state_dim, feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim),
-            nn.ReLU(inplace=True),
+        hand_prior_in = 2 * self.latent_dim  # [mu, log_var]
+        self.hand_prior_encoder, hand_prior_feat_dim = build_state_encoder(
+            hand_prior_in, state_encoder_type,
         )
+        self.arm_feat_dim = arm_feat_dim
+        self.hand_prior_feat_dim = hand_prior_feat_dim
 
-        self.hand_prior_encoder = nn.Sequential(
-            nn.Linear(2 * self.latent_dim, feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        # ── Arm branch: MLP head ──
+        # ── Arm head ──  input: [visual_feat, arm_state_feat]
+        arm_in = self.VISUAL_DIM + arm_feat_dim
         arm_layers = [
-            nn.Linear(feat_dim * 2, fusion_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(fusion_dim, fusion_dim),
+            nn.Linear(arm_in, 512),
             nn.ReLU(inplace=True),
         ]
         if dropout > 0:
             arm_layers.append(nn.Dropout(dropout))
         arm_layers.extend([
-            nn.Linear(fusion_dim, 128),
+            nn.Linear(512, 256),
             nn.ReLU(inplace=True),
         ])
         if dropout > 0:
             arm_layers.append(nn.Dropout(dropout))
-        arm_layers.append(nn.Linear(128, 6))
+        arm_layers.append(nn.Linear(256, 6))
         self.arm_head = nn.Sequential(*arm_layers)
 
-        # ── Hand branch ──
+        # ── Hand delta_z head ──  input: [visual_feat, hand_prior_feat, arm_state_feat]
+        hand_in = self.VISUAL_DIM + hand_prior_feat_dim + arm_feat_dim
         hand_layers = [
-            nn.Linear(feat_dim * 3, fusion_dim),
+            nn.Linear(hand_in, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(fusion_dim, 64),
+            nn.Linear(256, 64),
             nn.ReLU(inplace=True),
         ]
         if dropout > 0:
@@ -167,16 +196,17 @@ class BCPolicy(nn.Module):
         self._zero_init_delta_head()
 
     def _zero_init_delta_head(self):
-        """Zero out the final Linear of the hand delta-z head."""
         last_linear = self.hand_delta_z_head[-1]
         assert isinstance(last_linear, nn.Linear)
         nn.init.zeros_(last_linear.weight)
         nn.init.zeros_(last_linear.bias)
 
     def train(self, mode: bool = True):
-        """Override so the wrapped frozen VAE never re-enters train mode."""
+        """Keep frozen VAE (and optionally frozen backbone) in eval mode."""
         super().train(mode)
         self.vae.eval()
+        if getattr(self.backbone, "freeze_backbone", False):
+            self.backbone.resnet.eval()
         return self
 
     def encode_visual(
@@ -184,9 +214,9 @@ class BCPolicy(nn.Module):
         img_main: torch.Tensor,
         img_extra: torch.Tensor,
     ) -> torch.Tensor:
-        f_main = self.cnn_main(img_main)
-        f_extra = self.cnn_extra(img_extra)
-        return self.visual_fusion(torch.cat([f_main, f_extra], dim=-1))
+        f_main = self.backbone(img_main)    # (B, 512)
+        f_extra = self.backbone(img_extra)  # (B, 512)
+        return torch.cat([f_main, f_extra], dim=-1)  # (B, 1024)
 
     def forward(
         self,
@@ -201,7 +231,7 @@ class BCPolicy(nn.Module):
         Returns dict with arm_action (B,6), hand_action (B,6), hand_no_corr (B,6),
         action_pred (B,12), mu_prior, log_var_prior, delta_z, z_ctrl, z_no_corr.
         """
-        visual_feat = self.encode_visual(img_main, img_extra)
+        visual_feat = self.encode_visual(img_main, img_extra)   # (B, 1024)
         arm_state = state[..., :self.arm_state_dim]
         arm_state_feat = self.arm_state_encoder(arm_state)
 
@@ -214,7 +244,9 @@ class BCPolicy(nn.Module):
         if zero_delta:
             delta_z = torch.zeros_like(mu_p)
         else:
-            hand_input = torch.cat([visual_feat, hand_prior_feat, arm_state_feat], dim=-1)
+            hand_input = torch.cat(
+                [visual_feat, hand_prior_feat, arm_state_feat], dim=-1,
+            )
             delta_z = self.hand_delta_z_head(hand_input)
 
         z_ctrl = mu_p + delta_z
@@ -241,7 +273,6 @@ class BCPolicy(nn.Module):
 
 
 def trainable_params(module: nn.Module):
-    """Iterator over module parameters with requires_grad=True."""
     return [p for p in module.parameters() if p.requires_grad]
 
 

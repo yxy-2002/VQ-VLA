@@ -42,6 +42,7 @@ def _load(path, name):
 _policy_mod = _load(os.path.join(_BC_ROOT, "model/bc_policy.py"), "bc_policy")
 _dataset_mod = _load(os.path.join(_BC_ROOT, "model/bc_dataset.py"), "bc_dataset")
 BCPolicy = _policy_mod.BCPolicy
+ResNet18Backbone = _policy_mod.ResNet18Backbone
 build_and_freeze_vae = _policy_mod.build_and_freeze_vae
 
 ARM_NAMES = [f"arm_{i}" for i in range(6)]
@@ -443,11 +444,12 @@ def main():
         or os.path.join(_PROJ_ROOT, "pretrained_model/vae_single_step_ckpt/checkpoint.pth")
     )
     vae = build_and_freeze_vae(vae_path)
+    backbone = ResNet18Backbone(freeze=bc_args.get("freeze_backbone", False))
     policy = BCPolicy(
         vae=vae,
+        backbone=backbone,
         arm_state_dim=bc_args.get("arm_state_dim", 6),
-        feat_dim=bc_args.get("feat_dim", 128),
-        fusion_dim=bc_args.get("fusion_dim", 256),
+        state_encoder_type=bc_args.get("state_encoder", "mlp"),
         dropout=bc_args.get("dropout", 0.0),
     ).to(device)
     missing, unexpected = policy.load_state_dict(bc_ckpt["model"], strict=False)

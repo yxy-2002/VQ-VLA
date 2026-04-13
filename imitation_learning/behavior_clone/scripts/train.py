@@ -45,6 +45,7 @@ _utils_mod = _load(os.path.join(_VAE_ROOT, "model/utils.py"), "vae_utils")
 BCDataset = _dataset_mod.BCDataset
 compute_action_stats = _dataset_mod.compute_action_stats
 BCPolicy = _policy_mod.BCPolicy
+ResNet18Backbone = _policy_mod.ResNet18Backbone
 build_and_freeze_vae = _policy_mod.build_and_freeze_vae
 trainable_params = _policy_mod.trainable_params
 strip_vae_state_dict = _policy_mod.strip_vae_state_dict
@@ -65,15 +66,25 @@ def get_args():
     p.add_argument("--window_size", type=int, default=8,
                    help="VAE prior window size — must match VAE training")
     # Model
-    p.add_argument("--feat_dim", type=int, default=128,
-                   help="Per-branch feature width before fusion")
-    p.add_argument("--fusion_dim", type=int, default=256)
+    p.add_argument("--state_encoder", type=str, default="mlp",
+                   choices=["mlp", "linear64", "raw"],
+                   help="Encoder variant for arm_state and hand_prior: "
+                        "'mlp' (2-layer → 128), 'linear64' (single Linear → 64), "
+                        "or 'raw' (identity passthrough).")
+    p.add_argument("--freeze_backbone", action="store_true",
+                   help="If set, freeze ResNet-18 backbone (no fine-tuning).")
+    p.add_argument("--backbone_lr_scale", type=float, default=0.1,
+                   help="Multiplier on --lr for the visual backbone "
+                        "(heads use the full --lr). Ignored if --freeze_backbone.")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="Dropout probability in the arm/head MLPs")
     # Training
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--no_amp", dest="use_amp", action="store_false",
+                   help="Disable mixed precision (default: enabled).")
+    p.set_defaults(use_amp=True)
     p.add_argument("--lr", type=float, default=5e-4,
-                   help="Lower than VAE's 2e-3 — from-scratch CNN can spike at higher LR")
+                   help="Head learning rate. Backbone uses lr * backbone_lr_scale.")
     p.add_argument("--min_lr", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--total_steps", type=int, default=20000)
@@ -284,6 +295,10 @@ def main():
     # ── VAE ──
     vae = build_and_freeze_vae(args.vae_ckpt)
 
+    # ── Visual backbone (shared ResNet-18) ──
+    backbone = ResNet18Backbone(freeze=args.freeze_backbone)
+    print(f"[Backbone] ResNet-18 pretrained  freeze={args.freeze_backbone}")
+
     # ── Datasets ──
     train_ds = BCDataset(
         args.train_dir, action_mean=action_mean, action_std=action_std,
@@ -306,29 +321,53 @@ def main():
         num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── Model: frozen VAE wrapped inside BCPolicy ──
+    # ── Model: frozen VAE + ResNet backbone wrapped inside BCPolicy ──
     policy = BCPolicy(
         vae=vae,
+        backbone=backbone,
         arm_state_dim=6,
-        feat_dim=args.feat_dim,
-        fusion_dim=args.fusion_dim,
+        state_encoder_type=args.state_encoder,
         dropout=args.dropout,
     ).to(device)
     print(f"[Aug] noise_std_hand={args.noise_std_hand}  noise_std_arm={args.noise_std_arm}")
-    print("[Arch] BC 3.0 — weakly-coupled arm/hand branches, hand conditioned on arm.")
+    print(f"[Arch] BC ResNet-18 + state_encoder={args.state_encoder}  "
+          f"(arm_feat={policy.arm_feat_dim}, hand_prior_feat={policy.hand_prior_feat_dim})")
 
     n_total = sum(p.numel() for p in policy.parameters())
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"Policy parameters: total={n_total:,}  trainable={n_train:,}  "
           f"frozen={n_total - n_train:,}")
 
-    # ── Optimizer & LR schedule (no beta — BC has no KL) ──
+    # ── Optimizer with differential LR (backbone vs heads) ──
+    head_params, backbone_params = [], []
+    for name, pval in policy.named_parameters():
+        if not pval.requires_grad:
+            continue
+        if name.startswith("backbone."):
+            backbone_params.append(pval)
+        else:
+            head_params.append(pval)
+
+    param_groups = [{"params": head_params, "lr_scale": 1.0}]
+    if backbone_params and not args.freeze_backbone:
+        param_groups.append({"params": backbone_params, "lr_scale": args.backbone_lr_scale})
+        print(f"[Opt] backbone_lr_scale={args.backbone_lr_scale}  "
+              f"head params={sum(p.numel() for p in head_params):,}  "
+              f"backbone params={sum(p.numel() for p in backbone_params):,}")
+    else:
+        print(f"[Opt] backbone frozen; head params={sum(p.numel() for p in head_params):,}")
+
     optimizer = torch.optim.AdamW(
-        trainable_params(policy), lr=args.lr, weight_decay=args.weight_decay,
+        param_groups, lr=args.lr, weight_decay=args.weight_decay,
     )
     lr_schedule = cosine_scheduler(
         args.lr, args.min_lr, args.total_steps, warmup_steps=args.warmup_steps,
     )
+
+    # ── AMP ──
+    scaler = torch.amp.GradScaler("cuda", enabled=args.use_amp)
+    amp_dtype = torch.float16
+    print(f"[AMP] use_amp={args.use_amp}  dtype={amp_dtype}")
 
     # ── Step-0 sanity check ──
     # Verify zero-init: the hand delta-z head must output exactly 0 on a real batch.
@@ -376,44 +415,48 @@ def main():
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
+        base_lr = lr_schedule[step]
         for pg in optimizer.param_groups:
-            pg["lr"] = lr_schedule[step]
+            pg["lr"] = base_lr * pg.get("lr_scale", 1.0)
 
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         gt = batch["gt_action"]
 
-        out = policy(
-            img_main=batch["img_main"],
-            img_extra=batch["img_extra"],
-            state=batch["state"],
-            past_hand_win=batch["past_hand_win"],
-        )
-        arm_loss = F.mse_loss(out["arm_action"], gt[:, :6])
-        hand_loss = F.mse_loss(out["hand_action"], gt[:, 6:])
-        # Drift regularizer: pull BC's hand prediction toward the decoder output
-        # at the frozen prior mean. The decoder is frozen, so gradients flow only
-        # through the corrected hand path.
-        drift_loss = F.mse_loss(out["hand_action"], out["hand_no_corr"])
-        loss = arm_loss + hand_loss + args.reg_drift * drift_loss
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.use_amp):
+            out = policy(
+                img_main=batch["img_main"],
+                img_extra=batch["img_extra"],
+                state=batch["state"],
+                past_hand_win=batch["past_hand_win"],
+            )
+            arm_loss = F.mse_loss(out["arm_action"], gt[:, :6])
+            hand_loss = F.mse_loss(out["hand_action"], gt[:, 6:])
+            # Drift regularizer: pull BC's hand prediction toward the decoder output
+            # at the frozen prior mean. The decoder is frozen, so gradients flow only
+            # through the corrected hand path.
+            drift_loss = F.mse_loss(out["hand_action"], out["hand_no_corr"])
+            loss = arm_loss + hand_loss + args.reg_drift * drift_loss
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(trainable_params(policy), args.clip_grad)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         history["steps"].append(step)
         history["train_total"].append(loss.item())
         history["train_arm"].append(arm_loss.item())
         history["train_hand"].append(hand_loss.item())
         history["train_drift"].append(drift_loss.item())
-        history["train_lr"].append(lr_schedule[step])
+        history["train_lr"].append(base_lr)
 
         if step % args.print_freq == 0:
             elapsed = time.time() - t0
             print(f"[Step {step:>5d}] total={loss.item():.6f}  "
                   f"arm={arm_loss.item():.6f}  hand={hand_loss.item():.6f}  "
                   f"drift={drift_loss.item():.6f}  "
-                  f"lr={lr_schedule[step]:.2e}  ({elapsed:.0f}s)")
+                  f"lr={base_lr:.2e}  ({elapsed:.0f}s)")
 
         if step > 0 and step % args.eval_freq == 0:
             ev = evaluate(policy, test_loader, device)

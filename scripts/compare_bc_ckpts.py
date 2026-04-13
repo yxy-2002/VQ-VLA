@@ -27,6 +27,7 @@ def _load(path, name):
 policy_mod = _load(os.path.join(_BC_ROOT, "model/bc_policy.py"), "bc_policy")
 eval_mod = _load(os.path.join(_BC_ROOT, "scripts/eval.py"), "bc_eval")
 BCPolicy = policy_mod.BCPolicy
+ResNet18Backbone = policy_mod.ResNet18Backbone
 build_and_freeze_vae = policy_mod.build_and_freeze_vae
 load_trajectory = eval_mod.load_trajectory
 rollout_ar = eval_mod.rollout_ar
@@ -40,11 +41,12 @@ def evaluate_ckpt(ckpt_path, test_files, device, num_samples=1):
 
     vae_path = bc_args.get("vae_ckpt") or os.path.join(_PROJ_ROOT, "pretrained_model/vae_single_step_ckpt/checkpoint.pth")
     vae = build_and_freeze_vae(vae_path)
+    backbone = ResNet18Backbone(freeze=bc_args.get("freeze_backbone", False))
     policy = BCPolicy(
         vae=vae,
+        backbone=backbone,
         arm_state_dim=bc_args.get("arm_state_dim", 6),
-        feat_dim=bc_args.get("feat_dim", 128),
-        fusion_dim=bc_args.get("fusion_dim", 256),
+        state_encoder_type=bc_args.get("state_encoder", "mlp"),
         dropout=bc_args.get("dropout", 0.0),
     ).to(device)
     policy.load_state_dict(ckpt["model"], strict=False)
